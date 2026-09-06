@@ -1,0 +1,28 @@
+{
+  "name": "ai-task-manager",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w apps/web",
+    "build": "npm run build -w packages/domain && npm run build -w apps/web",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "test:unit": "npm run test -w packages/domain",
+    "test:integration": "npm run test:integration -w apps/web",
+    "test:e2e": "npm run test:e2e -w apps/web",
+    "db:generate": "npm run db:generate -w packages/db",
+    "db:migrate": "npm run db:migrate -w packages/db",
+    "db:seed": "npm run db:seed -w packages/db"
+  },
+  "devDependencies": {
+    "@types/node": "20.17.9",
+    "typescript": "5.6.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

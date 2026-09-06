@@ -1,0 +1,631 @@
+// Prisma schema — implements docs/architecture/03-database-erd.md
+// Additive fields beyond doc 03 (called out inline) satisfy the confirmed decision in
+// doc 13 #9/#12 and the "Third Required Workflow" (cross-department origin retention):
+// Task gains originOrganizationId/originDepartmentId/originTeamId/originAssignorId,
+// set once and never overwritten as the assignment chain moves.
+//
+// `passwordHash` on User is a Phase 1 local-auth field — see
+// docs/architecture/14-phase1-implementation-deviations.md. It is not part of the
+// Supabase-Auth-based design and is dropped when that swap happens.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────────────────────────────────
+
+enum WorkspaceType {
+  PERSONAL
+  ORGANIZATION
+}
+
+enum OrgMemberStatus {
+  ACTIVE
+  INVITED
+  SUSPENDED
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+// doc 05 — task lifecycle. OVERDUE is intentionally NOT a stored state (derived).
+enum TaskStatus {
+  DRAFT
+  UNASSIGNED
+  ASSIGNED
+  IN_PROGRESS
+  SUBMITTED
+  UNDER_REVIEW
+  CHANGES_REQUESTED
+  COMPLETED
+  CANCELLED
+}
+
+enum TaskCreatedVia {
+  DIRECT
+  AI
+}
+
+enum AssigneeType {
+  USER
+  TEAM
+}
+
+// doc 06 — per-assignment acknowledgement lifecycle.
+enum AssignmentStatus {
+  PENDING_ACKNOWLEDGEMENT
+  ACCEPTED
+  DECLINED
+  SUPERSEDED
+}
+
+enum ReviewDecision {
+  APPROVED
+  CHANGES_REQUESTED
+}
+
+enum AuditSource {
+  UI
+  API
+  AI
+  SYSTEM
+}
+
+enum DeliveryChannel {
+  IN_APP
+  PUSH
+  EMAIL
+}
+
+enum ProjectStatus {
+  ACTIVE
+  ON_HOLD
+  COMPLETED
+  ARCHIVED
+}
+
+enum DependencyType {
+  BLOCKS
+  RELATES_TO
+}
+
+enum ScopeType {
+  ORGANIZATION
+  DEPARTMENT
+  TEAM
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Identity & tenancy
+// ─────────────────────────────────────────────────────────────────────────
+
+model User {
+  id               String   @id @default(uuid())
+  email            String   @unique
+  fullName         String   @map("full_name")
+  avatarUrl        String?  @map("avatar_url")
+  defaultTimezone  String   @default("UTC") @map("default_timezone")
+  passwordHash     String   @map("password_hash") // Phase 1 local auth only — see doc 14
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  organizationMemberships OrganizationMember[]
+  createdOrganizations    Organization[]        @relation("OrgCreatedBy")
+  createdDepartments      Department[]          @relation("DeptCreatedBy")
+  createdTeams            Team[]                @relation("TeamCreatedBy")
+  teamMemberships         TeamMember[]
+  userRoles               UserRole[]            @relation("UserRoleHolder")
+  grantedRoles            UserRole[]            @relation("UserRoleGrantedBy")
+  ownedWorkspaces         Workspace[]
+  ownedProjects           Project[]
+  createdTasks            Task[]                @relation("TaskCreatedBy")
+  assignmentsMade         TaskAssignment[]      @relation("AssignmentAssignedBy")
+  assignmentsReceived     TaskAssignment[]      @relation("AssignmentAssigneeUser")
+  assignmentsRespondedTo  TaskAssignment[]      @relation("AssignmentRespondedBy")
+  checklistItemsCreated   TaskChecklistItem[]
+  comments                TaskComment[]
+  updates                 TaskUpdate[]
+  attachmentsUploaded     TaskAttachment[]
+  reviews                 TaskReview[]
+  notifications           Notification[]
+  auditLogsAsActor        AuditLog[]
+  originAssignedTasks     Task[]                @relation("TaskOriginAssignor")
+  aiInteractions          AiInteraction[]
+
+  @@map("users")
+}
+
+model Organization {
+  id          String   @id @default(uuid())
+  name        String
+  slug        String   @unique
+  settings    Json     @default("{}")
+  createdById String   @map("created_by")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  createdBy   User                  @relation("OrgCreatedBy", fields: [createdById], references: [id])
+  members     OrganizationMember[]
+  departments Department[]
+  teams       Team[]
+  roles       Role[]
+  userRoles   UserRole[]
+  workspaces  Workspace[]
+  tags        Tag[]
+  auditLogs   AuditLog[]
+  aiInteractions AiInteraction[]
+  originTasks Task[]          @relation("TaskOriginOrganization")
+
+  @@map("organizations")
+}
+
+model OrganizationMember {
+  id             String          @id @default(uuid())
+  organizationId String          @map("organization_id")
+  userId         String          @map("user_id")
+  status         OrgMemberStatus @default(ACTIVE)
+  joinedAt       DateTime        @default(now()) @map("joined_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, userId])
+  @@index([organizationId])
+  @@index([userId])
+  @@map("organization_members")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Departments & teams
+// ─────────────────────────────────────────────────────────────────────────
+
+model Department {
+  id                   String   @id @default(uuid())
+  organizationId       String   @map("organization_id")
+  parentDepartmentId   String?  @map("parent_department_id")
+  name                 String
+  createdById          String   @map("created_by")
+  createdAt            DateTime @default(now()) @map("created_at")
+
+  organization     Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  parentDepartment Department?  @relation("DeptHierarchy", fields: [parentDepartmentId], references: [id])
+  childDepartments Department[] @relation("DeptHierarchy")
+  createdBy        User         @relation("DeptCreatedBy", fields: [createdById], references: [id])
+  teams            Team[]
+  projects         Project[]
+  originTasks      Task[]       @relation("TaskOriginDepartment")
+
+  @@index([organizationId])
+  @@map("departments")
+}
+
+model Team {
+  id             String   @id @default(uuid())
+  organizationId String   @map("organization_id")
+  departmentId   String?  @map("department_id")
+  name           String
+  createdById    String   @map("created_by")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  organization        Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  department           Department?      @relation(fields: [departmentId], references: [id])
+  createdBy            User             @relation("TeamCreatedBy", fields: [createdById], references: [id])
+  members              TeamMember[]
+  projects             Project[]
+  assignmentsAsAssignee TaskAssignment[] @relation("AssignmentAssigneeTeam")
+  originTasks          Task[]           @relation("TaskOriginTeam")
+
+  @@index([organizationId])
+  @@index([departmentId])
+  @@map("teams")
+}
+
+model TeamMember {
+  id       String   @id @default(uuid())
+  teamId   String   @map("team_id")
+  userId   String   @map("user_id")
+  isHead   Boolean  @default(false) @map("is_head")
+  joinedAt DateTime @default(now()) @map("joined_at")
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([teamId, userId])
+  @@index([teamId])
+  @@index([userId])
+  @@map("team_members")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// RBAC (doc 04)
+// ─────────────────────────────────────────────────────────────────────────
+
+model Role {
+  id             String   @id @default(uuid())
+  organizationId String?  @map("organization_id") // null = system template role
+  name           String
+  isSystem       Boolean  @default(false) @map("is_system")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  organization    Organization?    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  rolePermissions RolePermission[]
+  userRoles       UserRole[]
+
+  @@index([organizationId])
+  @@map("roles")
+}
+
+model Permission {
+  id          String @id @default(uuid())
+  key         String @unique
+  description String
+
+  rolePermissions RolePermission[]
+
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       String @map("role_id")
+  permissionId String @map("permission_id")
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+model UserRole {
+  id             String    @id @default(uuid())
+  userId         String    @map("user_id")
+  roleId         String    @map("role_id")
+  organizationId String    @map("organization_id")
+  scopeType      ScopeType @map("scope_type")
+  scopeId        String?   @map("scope_id") // department_id or team_id; null when scopeType=ORGANIZATION
+  grantedById    String    @map("granted_by")
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  user         User         @relation("UserRoleHolder", fields: [userId], references: [id], onDelete: Cascade)
+  role         Role         @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  grantedBy    User         @relation("UserRoleGrantedBy", fields: [grantedById], references: [id])
+
+  @@index([userId, organizationId])
+  @@index([organizationId, scopeType, scopeId])
+  @@map("user_roles")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Workspaces & projects
+// ─────────────────────────────────────────────────────────────────────────
+
+model Workspace {
+  id             String        @id @default(uuid())
+  type           WorkspaceType
+  ownerUserId    String?       @map("owner_user_id") // set iff type=PERSONAL
+  organizationId String?       @map("organization_id") // set iff type=ORGANIZATION
+  name           String
+  createdAt      DateTime      @default(now()) @map("created_at")
+
+  // Cascade (not the Prisma default of nulling the FK) — a personal workspace's
+  // owner_user_id must always satisfy the workspaces_owner_xor_org_check constraint, so
+  // deleting the owning user has to delete their personal workspace, never null it out.
+  owner        User?        @relation(fields: [ownerUserId], references: [id], onDelete: Cascade)
+  // Same reasoning as `owner` above, for the organization-workspace side of the check.
+  organization Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  projects     Project[]
+  tasks        Task[]
+
+  @@index([ownerUserId])
+  @@index([organizationId])
+  @@map("workspaces")
+  // CHECK (exactly one of owner_user_id / organization_id set) added via raw-SQL migration
+}
+
+model Project {
+  id           String        @id @default(uuid())
+  workspaceId  String        @map("workspace_id")
+  departmentId String?       @map("department_id")
+  teamId       String?       @map("team_id")
+  name         String
+  description  String?
+  ownerId      String        @map("owner_id")
+  status       ProjectStatus @default(ACTIVE)
+  createdAt    DateTime      @default(now()) @map("created_at")
+
+  workspace  Workspace   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  department Department? @relation(fields: [departmentId], references: [id])
+  team       Team?       @relation(fields: [teamId], references: [id])
+  owner      User        @relation(fields: [ownerId], references: [id])
+  tasks      Task[]
+
+  @@index([workspaceId])
+  @@map("projects")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Tasks & the assignment chain (doc 05, doc 06) — the core of the system
+// ─────────────────────────────────────────────────────────────────────────
+
+model Task {
+  id                        String         @id @default(uuid())
+  workspaceId               String         @map("workspace_id")
+  projectId                 String?        @map("project_id")
+  parentTaskId              String?        @map("parent_task_id")
+  title                     String
+  description               String?
+  priority                  TaskPriority   @default(MEDIUM)
+  status                    TaskStatus     @default(UNASSIGNED)
+  startDate                 DateTime?      @map("start_date") @db.Date
+  dueDate                   DateTime?      @map("due_date")
+  estimatedDurationMinutes  Int?           @map("estimated_duration_minutes")
+  createdById               String         @map("created_by")
+  createdVia                TaskCreatedVia @default(DIRECT) @map("created_via")
+
+  // Origin fields — set once (at creation / first assignment) and NEVER overwritten by
+  // later reassignment. Required by doc 13 #9/#12 and the cross-department test scenario.
+  originOrganizationId String? @map("origin_organization_id")
+  originDepartmentId   String? @map("origin_department_id")
+  originTeamId         String? @map("origin_team_id")
+  originAssignorId     String? @map("origin_assignor_id")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  workspace         Workspace           @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  project           Project?            @relation(fields: [projectId], references: [id])
+  parentTask        Task?               @relation("TaskSubtasks", fields: [parentTaskId], references: [id])
+  subtasks          Task[]              @relation("TaskSubtasks")
+  createdBy         User                @relation("TaskCreatedBy", fields: [createdById], references: [id])
+  originOrganization Organization?      @relation("TaskOriginOrganization", fields: [originOrganizationId], references: [id])
+  originDepartment  Department?         @relation("TaskOriginDepartment", fields: [originDepartmentId], references: [id])
+  originTeam        Team?               @relation("TaskOriginTeam", fields: [originTeamId], references: [id])
+  originAssignor    User?               @relation("TaskOriginAssignor", fields: [originAssignorId], references: [id])
+
+  assignments       TaskAssignment[]
+  checklistItems    TaskChecklistItem[]
+  comments          TaskComment[]
+  updates           TaskUpdate[]
+  attachments       TaskAttachment[]
+  dependencies      TaskDependency[]    @relation("DependentTask")
+  dependedOnBy      TaskDependency[]    @relation("DependsOnTask")
+  reviews           TaskReview[]
+  tags              TaskTag[]
+  notifications     Notification[]
+
+  @@index([workspaceId])
+  @@index([projectId])
+  @@index([status])
+  @@index([originOrganizationId])
+  @@map("tasks")
+}
+
+// The routing/acknowledgement chain (doc 06). One row per "hop."
+model TaskAssignment {
+  id                  String           @id @default(uuid())
+  taskId              String           @map("task_id")
+  assigneeType        AssigneeType     @map("assignee_type")
+  assigneeUserId      String?          @map("assignee_user_id") // set iff assigneeType=USER
+  assigneeTeamId      String?          @map("assignee_team_id") // set iff assigneeType=TEAM
+  assignedById        String           @map("assigned_by")
+  parentAssignmentId  String?          @map("parent_assignment_id")
+  status              AssignmentStatus @default(PENDING_ACKNOWLEDGEMENT)
+  respondedById       String?          @map("responded_by")
+  respondedAt         DateTime?        @map("responded_at")
+  declineReason       String?          @map("decline_reason")
+  isCurrent           Boolean          @default(true) @map("is_current")
+  createdAt           DateTime         @default(now()) @map("created_at")
+
+  task              Task             @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  assigneeUser      User?            @relation("AssignmentAssigneeUser", fields: [assigneeUserId], references: [id])
+  assigneeTeam      Team?            @relation("AssignmentAssigneeTeam", fields: [assigneeTeamId], references: [id])
+  assignedBy        User             @relation("AssignmentAssignedBy", fields: [assignedById], references: [id])
+  respondedBy       User?            @relation("AssignmentRespondedBy", fields: [respondedById], references: [id])
+  parentAssignment  TaskAssignment?  @relation("AssignmentChain", fields: [parentAssignmentId], references: [id])
+  childAssignments  TaskAssignment[] @relation("AssignmentChain")
+  updates           TaskUpdate[]
+  reviews           TaskReview[]
+
+  @@index([taskId])
+  @@index([assigneeUserId])
+  @@index([assigneeTeamId])
+  @@index([taskId, isCurrent])
+  @@map("task_assignments")
+}
+
+model TaskChecklistItem {
+  id          String   @id @default(uuid())
+  taskId      String   @map("task_id")
+  label       String
+  isDone      Boolean  @default(false) @map("is_done")
+  position    Int
+  createdById String   @map("created_by")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  task      Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  createdBy User @relation(fields: [createdById], references: [id])
+
+  @@index([taskId])
+  @@map("task_checklist_items")
+}
+
+model TaskComment {
+  id        String    @id @default(uuid())
+  taskId    String    @map("task_id")
+  userId    String    @map("user_id")
+  body      String
+  createdAt DateTime  @default(now()) @map("created_at")
+  editedAt  DateTime? @map("edited_at")
+
+  task        Task             @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  user        User             @relation(fields: [userId], references: [id])
+  attachments TaskAttachment[]
+
+  @@index([taskId])
+  @@map("task_comments")
+}
+
+model TaskUpdate {
+  id            String     @id @default(uuid())
+  taskId        String     @map("task_id")
+  assignmentId  String?    @map("assignment_id")
+  userId        String     @map("user_id")
+  percentage    Int?
+  statusSnapshot TaskStatus? @map("status_snapshot")
+  note          String?
+  createdAt     DateTime   @default(now()) @map("created_at")
+
+  task       Task            @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  assignment TaskAssignment? @relation(fields: [assignmentId], references: [id])
+  user       User            @relation(fields: [userId], references: [id])
+
+  @@index([taskId])
+  @@map("task_updates")
+}
+
+model TaskAttachment {
+  id           String   @id @default(uuid())
+  taskId       String   @map("task_id")
+  commentId    String?  @map("comment_id")
+  uploadedById String   @map("uploaded_by")
+  storagePath  String   @map("storage_path")
+  fileName     String   @map("file_name")
+  mimeType     String   @map("mime_type")
+  sizeBytes    BigInt   @map("size_bytes")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  task       Task         @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  comment    TaskComment? @relation(fields: [commentId], references: [id])
+  uploadedBy User         @relation(fields: [uploadedById], references: [id])
+
+  @@index([taskId])
+  @@map("task_attachments")
+}
+
+model TaskDependency {
+  id              String         @id @default(uuid())
+  taskId          String         @map("task_id")
+  dependsOnTaskId String         @map("depends_on_task_id")
+  type            DependencyType @default(BLOCKS)
+
+  task        Task @relation("DependentTask", fields: [taskId], references: [id], onDelete: Cascade)
+  dependsOnTask Task @relation("DependsOnTask", fields: [dependsOnTaskId], references: [id], onDelete: Cascade)
+
+  @@unique([taskId, dependsOnTaskId])
+  @@map("task_dependencies")
+}
+
+model TaskReview {
+  id           String         @id @default(uuid())
+  taskId       String         @map("task_id")
+  assignmentId String         @map("assignment_id")
+  reviewerId   String         @map("reviewer_id")
+  decision     ReviewDecision
+  notes        String?
+  createdAt    DateTime       @default(now()) @map("created_at")
+
+  task       Task           @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  assignment TaskAssignment @relation(fields: [assignmentId], references: [id])
+  reviewer   User           @relation(fields: [reviewerId], references: [id])
+
+  @@index([taskId])
+  @@map("task_reviews")
+}
+
+model Tag {
+  id             String  @id @default(uuid())
+  organizationId String? @map("organization_id")
+  name           String
+  color          String?
+
+  organization Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  tasks        TaskTag[]
+
+  @@map("tags")
+}
+
+model TaskTag {
+  taskId String @map("task_id")
+  tagId  String @map("tag_id")
+
+  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  tag  Tag  @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([taskId, tagId])
+  @@map("task_tags")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Notifications & audit
+// ─────────────────────────────────────────────────────────────────────────
+
+model Notification {
+  id              String          @id @default(uuid())
+  userId          String          @map("user_id")
+  type            String
+  payload         Json            @default("{}")
+  relatedTaskId   String?         @map("related_task_id")
+  isRead          Boolean         @default(false) @map("is_read")
+  deliveryChannel DeliveryChannel @default(IN_APP) @map("delivery_channel")
+  createdAt       DateTime        @default(now()) @map("created_at")
+
+  user        User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  relatedTask Task? @relation(fields: [relatedTaskId], references: [id])
+
+  @@index([userId, isRead])
+  @@map("notifications")
+}
+
+// Append-only. DB-level immutability (REVOKE UPDATE/DELETE from app role) is applied via
+// a raw-SQL migration — see doc 12 §12.7.
+model AuditLog {
+  id             String       @id @default(uuid())
+  organizationId String?      @map("organization_id")
+  actorId        String       @map("actor_id")
+  action         String
+  entityType     String       @map("entity_type")
+  entityId       String       @map("entity_id")
+  before         Json?
+  after          Json?
+  reason         String?
+  source         AuditSource  @default(UI)
+  createdAt      DateTime     @default(now()) @map("created_at")
+
+  organization Organization? @relation(fields: [organizationId], references: [id])
+  actor        User          @relation(fields: [actorId], references: [id])
+
+  @@index([organizationId])
+  @@index([entityType, entityId])
+  @@index([actorId])
+  @@map("audit_logs")
+}
+
+// Kept per the approved schema for forward compatibility; unused by any Phase 1 code
+// path (AI is out of scope for Phase 1).
+model AiInteraction {
+  id             String   @id @default(uuid())
+  userId         String   @map("user_id")
+  organizationId String?  @map("organization_id")
+  feature        String
+  input          Json
+  output         Json
+  model          String?
+  tokensUsed     Int?     @map("tokens_used")
+  acceptedByUser Boolean? @map("accepted_by_user")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  user         User          @relation(fields: [userId], references: [id])
+  organization Organization? @relation(fields: [organizationId], references: [id])
+
+  @@map("ai_interactions")
+}

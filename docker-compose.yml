@@ -1,0 +1,16 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: ai-task-manager-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app_dev_password
+      POSTGRES_DB: ai_task_manager
+    ports:
+      - "5433:5432"
+    volumes:
+      - ai_task_manager_pgdata:/var/lib/postgresql/data
+
+volumes:
+  ai_task_manager_pgdata:

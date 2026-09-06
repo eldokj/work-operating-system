@@ -1,0 +1,456 @@
+import { beforeAll, describe, expect, it } from "vitest";
+import { ApiClient } from "./api-client";
+import { E2E_BASE_URL } from "./global-setup";
+
+// Drives the brief's three mandatory Phase 1 acceptance scenarios end-to-end through the
+// real HTTP API (route handlers -> domain services -> Prisma -> Postgres) — no mocking.
+// Run number keeps emails unique across repeated local runs (no test-DB reset yet, see
+// docs/architecture/11-testing-strategy.md follow-up note in the Phase 1 completion report).
+const RUN = Date.now();
+const email = (name: string) => `${name}.${RUN}@abc-college.test`;
+
+interface User {
+  client: ApiClient;
+  id: string;
+  email: string;
+}
+
+async function signup(name: string, fullName: string): Promise<User> {
+  const client = new ApiClient(E2E_BASE_URL);
+  const res = await client.post<{ id: string; email: string }>("/api/v1/auth/signup", {
+    email: email(name),
+    password: "password123!",
+    fullName,
+  });
+  expect(res.status, JSON.stringify(res)).toBe(200);
+  return { client, id: res.data!.id, email: res.data!.email };
+}
+
+describe("ABC College — full Phase 1 acceptance scenario (brief §32/33)", () => {
+  let eldo: User, anu: User, rahul: User, priya: User, divya: User;
+  let orgId: string;
+  let orgWorkspaceId: string;
+  let marketingDeptId: string, financeDeptId: string, managementDeptId: string;
+  let marketingTeamId: string, financeTeamId: string;
+  let roleIdByName: Record<string, string> = {};
+
+  beforeAll(async () => {
+    eldo = await signup("eldo", "Eldo");
+    anu = await signup("anu", "Anu");
+    rahul = await signup("rahul", "Rahul");
+    priya = await signup("priya", "Priya");
+    divya = await signup("divya", "Divya");
+  });
+
+  it("Eldo creates organization ABC College", async () => {
+    const res = await eldo.client.post<{ id: string; name: string; slug: string }>("/api/v1/organizations", {
+      name: "ABC College",
+      slug: `abc-college-${RUN}`,
+    });
+    expect(res.status, JSON.stringify(res)).toBe(200);
+    orgId = res.data!.id;
+
+    const ws = await eldo.client.get<{ organizations: { id: string; organizationId: string }[] }>(
+      "/api/v1/workspaces"
+    );
+    orgWorkspaceId = ws.data!.organizations.find((w) => w.organizationId === orgId)!.id;
+    expect(orgWorkspaceId).toBeTruthy();
+  });
+
+  it("creates departments: Management, Finance, Marketing", async () => {
+    const mgmt = await eldo.client.post<{ id: string }>(`/api/v1/organizations/${orgId}/departments`, {
+      name: "Management",
+    });
+    const fin = await eldo.client.post<{ id: string }>(`/api/v1/organizations/${orgId}/departments`, {
+      name: "Finance",
+    });
+    const mkt = await eldo.client.post<{ id: string }>(`/api/v1/organizations/${orgId}/departments`, {
+      name: "Marketing",
+    });
+    expect(mgmt.status).toBe(200);
+    expect(fin.status).toBe(200);
+    expect(mkt.status).toBe(200);
+    managementDeptId = mgmt.data!.id;
+    financeDeptId = fin.data!.id;
+    marketingDeptId = mkt.data!.id;
+  });
+
+  it("creates Marketing Team and Finance Team", async () => {
+    const mktTeam = await eldo.client.post<{ id: string }>(`/api/v1/organizations/${orgId}/teams`, {
+      name: "Marketing Team",
+      departmentId: marketingDeptId,
+    });
+    const finTeam = await eldo.client.post<{ id: string }>(`/api/v1/organizations/${orgId}/teams`, {
+      name: "Finance Team",
+      departmentId: financeDeptId,
+    });
+    expect(mktTeam.status, JSON.stringify(mktTeam)).toBe(200);
+    expect(finTeam.status).toBe(200);
+    marketingTeamId = mktTeam.data!.id;
+    financeTeamId = finTeam.data!.id;
+  });
+
+  it("adds Anu, Rahul, Divya, Priya as org members", async () => {
+    for (const u of [anu, rahul, divya, priya]) {
+      const res = await eldo.client.post(`/api/v1/organizations/${orgId}/members`, { userId: u.id });
+      expect(res.status, JSON.stringify(res)).toBe(200);
+    }
+  });
+
+  it("looks up seeded system role ids", async () => {
+    const res = await eldo.client.get<Array<{ id: string; name: string; isSystem: boolean }>>(
+      `/api/v1/organizations/${orgId}/roles`
+    );
+    expect(res.status).toBe(200);
+    roleIdByName = Object.fromEntries(res.data!.filter((r) => r.isSystem).map((r) => [r.name, r.id]));
+    expect(roleIdByName.TEAM_HEAD).toBeTruthy();
+    expect(roleIdByName.MEMBER).toBeTruthy();
+  });
+
+  it("sets Anu as Marketing Head (team membership + TEAM_HEAD role) and Rahul/Divya as members", async () => {
+    // Team membership rows (drives Team-Head-acknowledgement eligibility via is_head).
+    const anuMember = await eldo.client.post(`/api/v1/teams/${marketingTeamId}/members`, {
+      userId: anu.id,
+      isHead: true,
+    });
+    expect(anuMember.status, JSON.stringify(anuMember)).toBe(200);
+    await eldo.client.post(`/api/v1/teams/${marketingTeamId}/members`, { userId: rahul.id });
+    await eldo.client.post(`/api/v1/teams/${marketingTeamId}/members`, { userId: divya.id });
+    await eldo.client.post(`/api/v1/teams/${financeTeamId}/members`, { userId: priya.id });
+
+    // RBAC role grants (drives permission checks — task.accept_on_behalf_of_team,
+    // task.reassign_internal, task.review for Anu; task.accept/comment/update_progress
+    // for Rahul/Divya).
+    const grantAnu = await eldo.client.post(`/api/v1/organizations/${orgId}/role-grants`, {
+      userId: anu.id,
+      roleId: roleIdByName.TEAM_HEAD,
+      scopeType: "TEAM",
+      scopeId: marketingTeamId,
+    });
+    expect(grantAnu.status, JSON.stringify(grantAnu)).toBe(200);
+
+    for (const u of [rahul, divya]) {
+      const grant = await eldo.client.post(`/api/v1/organizations/${orgId}/role-grants`, {
+        userId: u.id,
+        roleId: roleIdByName.MEMBER,
+        scopeType: "TEAM",
+        scopeId: marketingTeamId,
+      });
+      expect(grant.status).toBe(200);
+    }
+  });
+
+  // ── Critical Workflow (brief §32): Management -> Marketing Team -> Team Head -> Rahul ──
+
+  let taskId: string;
+  let teamAssignmentId: string;
+  let rahulAssignmentId: string;
+
+  it("Eldo creates 'Prepare the college marketing campaign' and assigns it to Marketing Team", async () => {
+    const created = await eldo.client.post<{ id: string; status: string }>("/api/v1/tasks", {
+      workspaceId: orgWorkspaceId,
+      title: "Prepare the college marketing campaign",
+      priority: "HIGH",
+    });
+    expect(created.status, JSON.stringify(created)).toBe(200);
+    expect(created.data!.status).toBe("UNASSIGNED");
+    taskId = created.data!.id;
+
+    const assigned = await eldo.client.post(`/api/v1/tasks/${taskId}/assignments`, {
+      assigneeType: "TEAM",
+      assigneeTeamId: marketingTeamId,
+    });
+    expect(assigned.status, JSON.stringify(assigned)).toBe(200);
+
+    const task = await eldo.client.get<{ status: string; assignments: Array<{ status: string; isCurrent: boolean; id: string; assigneeType: string }> }>(
+      `/api/v1/tasks/${taskId}`
+    );
+    expect(task.data!.status).toBe("ASSIGNED");
+    const current = task.data!.assignments.find((a) => a.isCurrent)!;
+    expect(current.status).toBe("PENDING_ACKNOWLEDGEMENT");
+    expect(current.assigneeType).toBe("TEAM");
+    teamAssignmentId = current.id;
+  });
+
+  it("ONLY the Team Head (Anu) sees it pending acknowledgement — not Rahul, not Divya", async () => {
+    const anuPending = await anu.client.get<Array<{ id: string }>>(
+      `/api/v1/tasks?workspaceId=${orgWorkspaceId}&view=PENDING_MY_ACKNOWLEDGEMENT`
+    );
+    expect(anuPending.data!.some((t) => t.id === taskId)).toBe(true);
+
+    const rahulPending = await rahul.client.get<Array<{ id: string }>>(
+      `/api/v1/tasks?workspaceId=${orgWorkspaceId}&view=PENDING_MY_ACKNOWLEDGEMENT`
+    );
+    expect(rahulPending.data!.some((t) => t.id === taskId)).toBe(false);
+
+    // Rule: a team assignment must NOT automatically create personal tasks for every
+    // member — Divya (plain member, not head) must not see it as "My Tasks" either.
+    const divyaMyTasks = await divya.client.get<Array<{ id: string }>>(
+      `/api/v1/tasks?workspaceId=${orgWorkspaceId}&view=MY_TASKS`
+    );
+    expect(divyaMyTasks.data!.some((t) => t.id === taskId)).toBe(false);
+  });
+
+  it("Anu accepts on behalf of the team — task stays ASSIGNED, not IN_PROGRESS yet", async () => {
+    const accept = await anu.client.post(`/api/v1/assignments/${teamAssignmentId}/accept`);
+    expect(accept.status, JSON.stringify(accept)).toBe(200);
+
+    const task = await eldo.client.get<{ status: string }>(`/api/v1/tasks/${taskId}`);
+    expect(task.data!.status).toBe("ASSIGNED"); // doc 06 §6.3
+
+    // Anu accepted on the team's behalf but is not the individual assignee — must not
+    // appear in her own "My Tasks".
+    const anuMyTasks = await anu.client.get<Array<{ id: string }>>(
+      `/api/v1/tasks?workspaceId=${orgWorkspaceId}&view=MY_TASKS`
+    );
+    expect(anuMyTasks.data!.some((t) => t.id === taskId)).toBe(false);
+  });
+
+  it("Anu (Team Head) internally assigns the task to Rahul", async () => {
+    const res = await anu.client.post<{ id: string; status: string }>(
+      `/api/v1/assignments/${teamAssignmentId}/reassign-internal`,
+      { assigneeUserId: rahul.id }
+    );
+    expect(res.status, JSON.stringify(res)).toBe(200);
+    expect(res.data!.status).toBe("PENDING_ACKNOWLEDGEMENT");
+    rahulAssignmentId = res.data!.id;
+
+    const rahulPending = await rahul.client.get<Array<{ id: string }>>(
+      `/api/v1/tasks?workspaceId=${orgWorkspaceId}&view=PENDING_MY_ACKNOWLEDGEMENT`
+    );
+    expect(rahulPending.data!.some((t) => t.id === taskId)).toBe(true);
+  });
+
+  it("Rahul accepts — task moves to IN_PROGRESS and appears ONLY in Rahul's My Tasks", async () => {
+    const accept = await rahul.client.post(`/api/v1/assignments/${rahulAssignmentId}/accept`);
+    expect(accept.status, JSON.stringify(accept)).toBe(200);
+
+    const task = await eldo.client.get<{ status: string }>(`/api/v1/tasks/${taskId}`);
+    expect(task.data!.status).toBe("IN_PROGRESS");
+
+    const rahulMyTasks = await rahul.client.get<Array<{ id: string }>>(
+      `/api/v1/tasks?workspaceId=${orgWorkspaceId}&view=MY_TASKS`
+    );
+    expect(rahulMyTasks.data!.some((t) => t.id === taskId)).toBe(true);
+
+    const divyaMyTasks = await divya.client.get<Array<{ id: string }>>(
+      `/api/v1/tasks?workspaceId=${orgWorkspaceId}&view=MY_TASKS`
+    );
+    expect(divyaMyTasks.data!.some((t) => t.id === taskId)).toBe(false);
+  });
+
+  it("Rahul adds a progress update, submits; Anu reviews and approves -> COMPLETED", async () => {
+    const update = await rahul.client.post(`/api/v1/tasks/${taskId}/updates`, {
+      percentage: 70,
+      note: "Draft campaign plan ready",
+    });
+    expect(update.status, JSON.stringify(update)).toBe(200);
+
+    const submit = await rahul.client.post<{ status: string }>(`/api/v1/tasks/${taskId}/submit`);
+    expect(submit.status, JSON.stringify(submit)).toBe(200);
+    expect(submit.data!.status).toBe("SUBMITTED");
+
+    const review = await anu.client.post<{ status: string }>(`/api/v1/tasks/${taskId}/reviews`, {
+      decision: "APPROVED",
+      notes: "Looks great",
+    });
+    expect(review.status, JSON.stringify(review)).toBe(200);
+    expect(review.data!.status).toBe("COMPLETED");
+  });
+
+  it("every major transition is recorded in the audit log", async () => {
+    const res = await eldo.client.get<{ items: Array<{ action: string; entityId: string }> }>(
+      `/api/v1/organizations/${orgId}/audit-logs?entityId=${taskId}&limit=100`
+    );
+    expect(res.status).toBe(200);
+    const actions = res.data!.items.map((e) => e.action);
+    const assignmentActions = (
+      await eldo.client.get<{ items: Array<{ action: string }> }>(
+        `/api/v1/organizations/${orgId}/audit-logs?entityType=TaskAssignment&limit=200`
+      )
+    ).data!.items.map((e) => e.action);
+
+    expect(actions).toContain("task.created");
+    expect(actions).toContain("task.approved");
+    expect(assignmentActions).toContain("task.assignment.created");
+    expect(assignmentActions).toContain("task.assignment.accepted");
+    expect(assignmentActions).toContain("task.assignment.reassigned_internal");
+  });
+
+  // ── Second Required Workflow: Eldo -> Rahul direct assignment + mandatory decline reason ──
+
+  describe("Second Required Workflow: direct individual assignment + decline", () => {
+    let directTaskId: string;
+    let directAssignmentId: string;
+
+    it("Eldo assigns a task directly to Rahul; Rahul sees PENDING_ACKNOWLEDGEMENT", async () => {
+      const created = await eldo.client.post<{ id: string }>("/api/v1/tasks", {
+        workspaceId: orgWorkspaceId,
+        title: "Book the auditorium for orientation day",
+        priority: "MEDIUM",
+        assignTo: { type: "USER", id: rahul.id },
+      });
+      expect(created.status, JSON.stringify(created)).toBe(200);
+      directTaskId = created.data!.id;
+
+      const task = await rahul.client.get<{ status: string; assignments: Array<{ id: string; isCurrent: boolean; status: string }> }>(
+        `/api/v1/tasks/${directTaskId}`
+      );
+      expect(task.data!.status).toBe("ASSIGNED");
+      const current = task.data!.assignments.find((a) => a.isCurrent)!;
+      expect(current.status).toBe("PENDING_ACKNOWLEDGEMENT");
+      directAssignmentId = current.id;
+    });
+
+    it("declining without a reason is rejected", async () => {
+      const res = await rahul.client.post(`/api/v1/assignments/${directAssignmentId}/decline`, { reason: "" });
+      expect(res.status).toBe(400);
+    });
+
+    it("Rahul declines with a reason; task reverts to UNASSIGNED and it's auditable", async () => {
+      const decline = await rahul.client.post(`/api/v1/assignments/${directAssignmentId}/decline`, {
+        reason: "I am currently handling three urgent finance tasks.",
+      });
+      expect(decline.status, JSON.stringify(decline)).toBe(200);
+
+      const task = await eldo.client.get<{ status: string }>(`/api/v1/tasks/${directTaskId}`);
+      expect(task.data!.status).toBe("UNASSIGNED");
+
+      const audit = await eldo.client.get<{ items: Array<{ action: string; reason: string | null }> }>(
+        `/api/v1/organizations/${orgId}/audit-logs?entityId=${directAssignmentId}`
+      );
+      const declineEntry = audit.data!.items.find((e) => e.action === "task.assignment.declined");
+      expect(declineEntry?.reason).toContain("finance tasks");
+    });
+  });
+
+  // ── Third Required Workflow: cross-department Finance -> Marketing, origin preserved ──
+
+  describe("Third Required Workflow: cross-department assignment retains origin", () => {
+    let crossDeptTaskId: string;
+    let crossDeptAssignmentId: string;
+
+    it("grants Priya org-wide cross-department assignment authority", async () => {
+      const role = await eldo.client.post<{ id: string }>(`/api/v1/organizations/${orgId}/roles`, {
+        name: "Cross-Department Coordinator",
+        permissionKeys: ["task.create", "task.assign_cross_department"],
+      });
+      expect(role.status, JSON.stringify(role)).toBe(200);
+
+      // ORGANIZATION-scoped: cross-department reach is inherently org-wide, not
+      // meaningfully limited to Priya's own (Finance) department — see doc 04 §4.5.
+      const grant = await eldo.client.post(`/api/v1/organizations/${orgId}/role-grants`, {
+        userId: priya.id,
+        roleId: role.data!.id,
+        scopeType: "ORGANIZATION",
+      });
+      expect(grant.status, JSON.stringify(grant)).toBe(200);
+    });
+
+    it("Priya (Finance) creates a task and assigns it to Marketing Team", async () => {
+      const created = await priya.client.post<{ id: string }>("/api/v1/tasks", {
+        workspaceId: orgWorkspaceId,
+        title: "Provide budget figures for the marketing campaign",
+        priority: "MEDIUM",
+      });
+      expect(created.status, JSON.stringify(created)).toBe(200);
+      crossDeptTaskId = created.data!.id;
+
+      const assign = await priya.client.post(`/api/v1/tasks/${crossDeptTaskId}/assignments`, {
+        assigneeType: "TEAM",
+        assigneeTeamId: marketingTeamId,
+      });
+      expect(assign.status, JSON.stringify(assign)).toBe(200);
+    });
+
+    it("Marketing Head (Anu) acknowledges it, and origin fields are retained", async () => {
+      const before = await eldo.client.get<{
+        assignments: Array<{ id: string; isCurrent: boolean }>;
+      }>(`/api/v1/tasks/${crossDeptTaskId}`);
+      crossDeptAssignmentId = before.data!.assignments.find((a) => a.isCurrent)!.id;
+
+      const accept = await anu.client.post(`/api/v1/assignments/${crossDeptAssignmentId}/accept`);
+      expect(accept.status, JSON.stringify(accept)).toBe(200);
+
+      const reassign = await anu.client.post<{ id: string }>(
+        `/api/v1/assignments/${crossDeptAssignmentId}/reassign-internal`,
+        { assigneeUserId: rahul.id }
+      );
+      expect(reassign.status, JSON.stringify(reassign)).toBe(200);
+      await rahul.client.post(`/api/v1/assignments/${reassign.data!.id}/accept`);
+
+      const task = await eldo.client.get<{
+        status: string;
+        createdBy: { id: string };
+        originOrganization: { id: string } | null;
+        originDepartment: { id: string; name: string } | null;
+        originTeam: { id: string; name: string } | null;
+        originAssignor: { id: string } | null;
+        assignments: Array<{ assignedBy: { id: string }; assigneeUser: { id: string } | null; isCurrent: boolean }>;
+      }>(`/api/v1/tasks/${crossDeptTaskId}`);
+
+      expect(task.data!.status).toBe("IN_PROGRESS");
+      // Origin retained even though the task is now routed to Marketing/Rahul:
+      expect(task.data!.createdBy.id).toBe(priya.id); // creator
+      expect(task.data!.originOrganization?.id).toBe(orgId); // origin organization
+      expect(task.data!.originTeam?.name).toBe("Marketing Team"); // destination team of first hop
+      expect(task.data!.originAssignor?.id).toBe(priya.id); // original assignor (Finance)
+
+      const current = task.data!.assignments.find((a) => a.isCurrent)!;
+      expect(current.assigneeUser?.id).toBe(rahul.id); // current accountable individual owner
+      expect(current.assignedBy.id).toBe(anu.id); // who most recently assigned it
+    });
+  });
+
+  // ── Personal workspace rule: self-assignment only, never assignable to others ──
+
+  describe("Personal workspace restrictions", () => {
+    it("a personal task is auto-accepted (self-assigned) and immediately IN_PROGRESS", async () => {
+      const ws = await rahul.client.get<{ personal: { id: string } }>("/api/v1/workspaces");
+      const personalWorkspaceId = ws.data!.personal.id;
+
+      const task = await rahul.client.post<{ id: string; status: string }>("/api/v1/tasks", {
+        workspaceId: personalWorkspaceId,
+        title: "Buy groceries",
+        priority: "LOW",
+      });
+      expect(task.status, JSON.stringify(task)).toBe(200);
+      expect(task.data!.status).toBe("IN_PROGRESS");
+    });
+
+    it("assigning a personal task to another person is rejected", async () => {
+      const ws = await rahul.client.get<{ personal: { id: string } }>("/api/v1/workspaces");
+      const personalWorkspaceId = ws.data!.personal.id;
+
+      const res = await rahul.client.post("/api/v1/tasks", {
+        workspaceId: personalWorkspaceId,
+        title: "Illegal cross-user assignment attempt",
+        assignTo: { type: "USER", id: divya.id },
+      });
+      expect(res.status).toBe(403);
+    });
+  });
+
+  // ── Multi-tenant isolation ──
+
+  describe("Multi-tenant isolation", () => {
+    it("a user outside the organization cannot read its departments", async () => {
+      const outsider = await signup("outsider", "Outsider");
+      const res = await outsider.client.get(`/api/v1/organizations/${orgId}/departments`);
+      expect(res.status).toBe(403);
+    });
+
+    it("a user without task.assign_cross_department cannot cross departments", async () => {
+      // Rahul is a plain MEMBER of Marketing — no cross-department permission.
+      const created = await rahul.client.post<{ id: string }>("/api/v1/tasks", {
+        workspaceId: orgWorkspaceId,
+        title: "Rahul tries to reach Finance without permission",
+      });
+      const attempt = await rahul.client.post(`/api/v1/tasks/${created.data!.id}/assignments`, {
+        assigneeType: "TEAM",
+        assigneeTeamId: financeTeamId,
+      });
+      expect(attempt.status).toBe(403);
+    });
+  });
+});

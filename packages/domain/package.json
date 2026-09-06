@@ -1,0 +1,22 @@
+{
+  "name": "@ai-task-manager/domain",
+  "version": "0.1.0",
+  "private": true,
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@ai-task-manager/db": "*",
+    "@ai-task-manager/shared": "*",
+    "bcryptjs": "2.4.3",
+    "zod": "3.24.1"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "2.4.6",
+    "typescript": "5.6.3",
+    "vitest": "2.1.8"
+  }
+}

@@ -26,6 +26,10 @@ export function describeNotification(type: string, payload: Record<string, unkno
       return `Changes requested on "${title}"`;
     case "task.completed":
       return `Completed: "${title}"`;
+    case "message.added":
+      return `New message on "${title}"`;
+    case "task.mentioned":
+      return `You were mentioned on "${title}"`;
     default:
       return `Update on "${title}"`;
   }

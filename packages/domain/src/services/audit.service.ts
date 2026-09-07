@@ -10,6 +10,13 @@ export interface AuditLogEntry {
   after?: unknown;
   reason?: string | null;
   source?: AuditSource;
+  /**
+   * Phase 2A addition (docs/architecture/15-task-conversation.md) — the task this entry
+   * relates to, when there is one. Optional and additive: existing call sites that don't
+   * pass it are unaffected. This is what lets the Activity tab query a task's full history
+   * with one indexed lookup instead of re-deriving it from entityType/entityId per action.
+   */
+  taskId?: string | null;
 }
 
 /**
@@ -34,8 +41,25 @@ export class AuditService {
         after: (entry.after ?? undefined) as Prisma.InputJsonValue | undefined,
         reason: entry.reason ?? null,
         source: entry.source ?? "API",
+        taskId: entry.taskId ?? null,
       },
     });
+  }
+
+  /** Full activity history for one task — doc 15 §Activity feed. Read-only; the caller is
+   * responsible for the view-access check (TaskService.getTaskByIdOrThrow) before calling. */
+  async listForTask(taskId: string, opts: { limit?: number; cursor?: string } = {}) {
+    const limit = opts.limit ?? 100;
+    const rows = await this.db.auditLog.findMany({
+      where: { taskId },
+      orderBy: { createdAt: "asc" },
+      take: limit + 1,
+      ...(opts.cursor ? { cursor: { id: opts.cursor }, skip: 1 } : {}),
+      include: { actor: { select: { id: true, fullName: true, email: true } } },
+    });
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+    return { items: page, nextCursor: hasMore ? page[page.length - 1]?.id ?? null : null };
   }
 
   async listForOrganization(

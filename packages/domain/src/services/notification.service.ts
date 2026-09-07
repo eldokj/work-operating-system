@@ -16,6 +16,9 @@ export const NotificationType = {
   REVIEW_COMPLETED: "review.completed",
   CHANGES_REQUESTED: "changes.requested",
   TASK_COMPLETED: "task.completed",
+  // Phase 2A additions — docs/architecture/15-task-conversation.md.
+  MESSAGE_ADDED: "message.added",
+  MENTIONED_IN_TASK: "task.mentioned",
 } as const;
 export type NotificationTypeValue = (typeof NotificationType)[keyof typeof NotificationType];
 

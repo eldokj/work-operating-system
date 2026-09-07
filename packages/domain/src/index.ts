@@ -10,6 +10,8 @@ export * from "./services/organization.service";
 export * from "./services/task.service";
 export * from "./services/assignment.service";
 export * from "./services/reporting.service";
+export * from "./services/conversation.service";
+export * from "./services/task-activity.service";
 export * from "./services/notification.service";
 export * from "./services/audit.service";
 export * from "./services/storage.service";

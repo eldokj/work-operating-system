@@ -146,6 +146,7 @@ export class AssignmentService {
         action: "task.assignment.created",
         entityType: "TaskAssignment",
         entityId: created.id,
+        taskId,
         after: {
           assigneeType: target.assigneeType,
           assigneeUserId: target.assigneeUserId ?? null,
@@ -227,6 +228,7 @@ export class AssignmentService {
         action: "task.assignment.accepted",
         entityType: "TaskAssignment",
         entityId: assignmentId,
+        taskId: assignment.taskId,
         before: { status: assignment.status },
         after: { status: "ACCEPTED" },
       });
@@ -287,6 +289,7 @@ export class AssignmentService {
         action: "task.assignment.declined",
         entityType: "TaskAssignment",
         entityId: assignmentId,
+        taskId: assignment.taskId,
         before: { status: assignment.status },
         after: { status: "DECLINED" },
         reason,
@@ -360,6 +363,7 @@ export class AssignmentService {
         action: "task.assignment.reassigned_internal",
         entityType: "TaskAssignment",
         entityId: child.id,
+        taskId: teamAssignment.taskId,
         after: { fromTeamAssignmentId: teamAssignmentId, assigneeUserId: targetUserId },
       });
 

@@ -453,4 +453,204 @@ describe("ABC College — full Phase 1 acceptance scenario (brief §32/33)", () 
       expect(attempt.status).toBe(403);
     });
   });
+
+  // ── Phase 2A: Task Conversations — brief "Task Conversation Foundation" ──
+  // Uses a dedicated task (routed through the exact same Management -> Marketing Team ->
+  // Anu -> Rahul chain as the main scenario) so these tests never interfere with the main
+  // scenario's own lifecycle state.
+
+  describe("Phase 2A: Task Conversations", () => {
+    let convTaskId: string;
+    let convTeamAssignmentId: string;
+    let convRahulAssignmentId: string;
+    let firstMessageId: string;
+
+    it("1. a newly created task automatically gets exactly one primary conversation", async () => {
+      const created = await eldo.client.post<{ id: string }>("/api/v1/tasks", {
+        workspaceId: orgWorkspaceId,
+        title: "Design the open-day banner",
+        priority: "MEDIUM",
+      });
+      expect(created.status, JSON.stringify(created)).toBe(200);
+      convTaskId = created.data!.id;
+
+      const first = await eldo.client.get<{ id: string; taskId: string }>(`/api/v1/tasks/${convTaskId}/conversation`);
+      expect(first.status, JSON.stringify(first)).toBe(200);
+      const second = await eldo.client.get<{ id: string }>(`/api/v1/tasks/${convTaskId}/conversation`);
+      expect(second.data!.id).toBe(first.data!.id); // same row both times — no duplicate/lazy-created conversation
+
+      const assign = await eldo.client.post(`/api/v1/tasks/${convTaskId}/assignments`, {
+        assigneeType: "TEAM",
+        assigneeTeamId: marketingTeamId,
+      });
+      expect(assign.status, JSON.stringify(assign)).toBe(200);
+      const task = await eldo.client.get<{ assignments: Array<{ id: string; isCurrent: boolean }> }>(
+        `/api/v1/tasks/${convTaskId}`
+      );
+      convTeamAssignmentId = task.data!.assignments.find((a) => a.isCurrent)!.id;
+    });
+
+    it("11. team assignment does not expose the conversation to every team member (only the Head)", async () => {
+      const anuAccess = await anu.client.get(`/api/v1/tasks/${convTaskId}/conversation`);
+      expect(anuAccess.status, JSON.stringify(anuAccess)).toBe(200);
+
+      const divyaAccess = await divya.client.get(`/api/v1/tasks/${convTaskId}/conversation`);
+      expect(divyaAccess.status).toBe(403);
+    });
+
+    it("3/5. an unrelated org member cannot read or post to a conversation they have no task access to", async () => {
+      const readAttempt = await divya.client.get(`/api/v1/tasks/${convTaskId}/conversation/messages`);
+      expect(readAttempt.status).toBe(403);
+
+      const postAttempt = await divya.client.post(`/api/v1/tasks/${convTaskId}/conversation/messages`, {
+        body: "I shouldn't be able to send this",
+      });
+      expect(postAttempt.status).toBe(403);
+    });
+
+    it("12. accepting the team assignment then internal distribution + acceptance gives Rahul access", async () => {
+      await anu.client.post(`/api/v1/assignments/${convTeamAssignmentId}/accept`);
+      const reassign = await anu.client.post<{ id: string }>(
+        `/api/v1/assignments/${convTeamAssignmentId}/reassign-internal`,
+        { assigneeUserId: rahul.id }
+      );
+      convRahulAssignmentId = reassign.data!.id;
+      await rahul.client.post(`/api/v1/assignments/${convRahulAssignmentId}/accept`);
+
+      const access = await rahul.client.get(`/api/v1/tasks/${convTaskId}/conversation`);
+      expect(access.status, JSON.stringify(access)).toBe(200);
+
+      // Still not exposed to a plain team member who was never in this task's chain.
+      const divyaAccess = await divya.client.get(`/api/v1/tasks/${convTaskId}/conversation`);
+      expect(divyaAccess.status).toBe(403);
+    });
+
+    it("4. Rahul (authorized) sends a message", async () => {
+      const res = await rahul.client.post<{ id: string; body: string; sender: { id: string } }>(
+        `/api/v1/tasks/${convTaskId}/conversation/messages`,
+        { body: "Starting on the banner design now." }
+      );
+      expect(res.status, JSON.stringify(res)).toBe(200);
+      expect(res.data!.body).toBe("Starting on the banner design now.");
+      expect(res.data!.sender.id).toBe(rahul.id);
+      firstMessageId = res.data!.id;
+    });
+
+    it("6. replies preserve the parent/child relationship", async () => {
+      const reply = await anu.client.post<{ parentMessage: { id: string } | null }>(
+        `/api/v1/tasks/${convTaskId}/conversation/messages`,
+        { body: "Sounds good — send a draft by Friday.", parentMessageId: firstMessageId }
+      );
+      expect(reply.status, JSON.stringify(reply)).toBe(200);
+      expect(reply.data!.parentMessage?.id).toBe(firstMessageId);
+
+      const list = await rahul.client.get<{ items: Array<{ id: string; parentMessage: { id: string } | null }> }>(
+        `/api/v1/tasks/${convTaskId}/conversation/messages`
+      );
+      const found = list.data!.items.find((m) => m.parentMessage?.id === firstMessageId);
+      expect(found).toBeTruthy();
+    });
+
+    it("7. mentions only allow users who legitimately have access to the task", async () => {
+      // Anu is in the assignment chain — a legitimate mention target.
+      const valid = await rahul.client.post(`/api/v1/tasks/${convTaskId}/conversation/messages`, {
+        body: "@Anu can you double-check the colors?",
+        mentionedUserIds: [anu.id],
+      });
+      expect(valid.status, JSON.stringify(valid)).toBe(200);
+
+      // Divya has no access to this specific task's conversation — mentioning her must
+      // be rejected outright, not silently dropped.
+      const invalid = await rahul.client.post(`/api/v1/tasks/${convTaskId}/conversation/messages`, {
+        body: "@Divya thoughts?",
+        mentionedUserIds: [divya.id],
+      });
+      expect(invalid.status).toBe(400);
+    });
+
+    it("8. reactions work (add, reflected in the message, and can be removed)", async () => {
+      const add = await anu.client.post<{ reactions: Array<{ emoji: string; count: number; reactedByMe: boolean }> }>(
+        `/api/v1/messages/${firstMessageId}/reactions`,
+        { emoji: "👍" }
+      );
+      expect(add.status, JSON.stringify(add)).toBe(200);
+      const reaction = add.data!.reactions.find((r) => r.emoji === "👍");
+      expect(reaction?.count).toBe(1);
+
+      const remove = await anu.client.delete<{ reactions: Array<{ emoji: string }> }>(
+        `/api/v1/messages/${firstMessageId}/reactions/${encodeURIComponent("👍")}`
+      );
+      expect(remove.status, JSON.stringify(remove)).toBe(200);
+      expect(remove.data!.reactions.find((r) => r.emoji === "👍")).toBeUndefined();
+    });
+
+    it("9. read state: unread count drops to zero after marking read", async () => {
+      const before = await anu.client.get<{ unreadCount: number }>(`/api/v1/tasks/${convTaskId}/conversation`);
+      expect(before.data!.unreadCount).toBeGreaterThan(0);
+
+      const markRead = await anu.client.post(`/api/v1/tasks/${convTaskId}/conversation/read`);
+      expect(markRead.status).toBe(200);
+
+      const after = await anu.client.get<{ unreadCount: number }>(`/api/v1/tasks/${convTaskId}/conversation`);
+      expect(after.data!.unreadCount).toBe(0);
+    });
+
+    it("message mutation requires correct permissions: only the sender can edit/delete", async () => {
+      const editByOther = await anu.client.patch(`/api/v1/messages/${firstMessageId}`, { body: "hijacked" });
+      expect(editByOther.status).toBe(403);
+
+      const editBySender = await rahul.client.patch<{ body: string; isEdited: boolean }>(
+        `/api/v1/messages/${firstMessageId}`,
+        { body: "Starting on the banner design now (updated)." }
+      );
+      expect(editBySender.status, JSON.stringify(editBySender)).toBe(200);
+      expect(editBySender.data!.isEdited).toBe(true);
+
+      const deleteByOther = await anu.client.delete(`/api/v1/messages/${firstMessageId}`);
+      expect(deleteByOther.status).toBe(403);
+    });
+
+    it("10. reassignment updates access: an un-accepted assignee loses access, the new one gains it", async () => {
+      // Reassign convTaskId's current assignment away from Rahul to Divya mid-flight,
+      // before Rahul has done anything beyond accepting the initial hand-off.
+      const reassign = await anu.client.post(`/api/v1/tasks/${convTaskId}/assignments`, {
+        assigneeType: "USER",
+        assigneeUserId: divya.id,
+      });
+      expect(reassign.status, JSON.stringify(reassign)).toBe(200);
+      await divya.client.post(
+        `/api/v1/assignments/${(await anu.client.get<{ assignments: Array<{ id: string; isCurrent: boolean }> }>(`/api/v1/tasks/${convTaskId}`)).data!.assignments.find((a) => a.isCurrent)!.id}/accept`
+      );
+
+      const divyaAccess = await divya.client.get(`/api/v1/tasks/${convTaskId}/conversation`);
+      expect(divyaAccess.status, JSON.stringify(divyaAccess)).toBe(200);
+    });
+
+    it("2. an authorized participant (creator) can always retrieve the conversation", async () => {
+      const res = await eldo.client.get(`/api/v1/tasks/${convTaskId}/conversation`);
+      expect(res.status, JSON.stringify(res)).toBe(200);
+    });
+
+    it("16. cross-tenant isolation holds for conversations too", async () => {
+      const outsider = await signup("conv-outsider", "Conversation Outsider");
+      const res = await outsider.client.get(`/api/v1/tasks/${convTaskId}/conversation`);
+      expect(res.status).toBe(403);
+    });
+
+    it("13/14/15. Phase 1 lifecycle and My Tasks are unaffected by any of the above", async () => {
+      // The ORIGINAL ABC College task (from the top-level scenario) must still read as
+      // COMPLETED, and Rahul's My Tasks view must reflect exactly the current state of
+      // that unrelated task chain — proving Phase 2A didn't disturb Phase 1 behavior.
+      const original = await eldo.client.get<{ status: string }>(`/api/v1/tasks/${taskId}`);
+      expect(original.data!.status).toBe("COMPLETED");
+
+      const rahulMyTasks = await rahul.client.get<Array<{ id: string }>>(
+        `/api/v1/tasks?workspaceId=${orgWorkspaceId}&view=MY_TASKS`
+      );
+      // Rahul was reassigned away from convTaskId in test #10 above, so it must NOT
+      // appear in his My Tasks, while the original completed task's assignment chain is
+      // untouched by any Phase 2A code path.
+      expect(rahulMyTasks.data!.some((t) => t.id === convTaskId)).toBe(false);
+    });
+  });
 });

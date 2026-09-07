@@ -141,6 +141,10 @@ model User {
   auditLogsAsActor        AuditLog[]
   originAssignedTasks     Task[]                @relation("TaskOriginAssignor")
   aiInteractions          AiInteraction[]
+  sentMessages            TaskMessage[]
+  messageMentions         TaskMessageMention[]
+  messageReactions        TaskMessageReaction[]
+  conversationReads       TaskConversationRead[]
 
   @@map("users")
 }
@@ -402,6 +406,10 @@ model Task {
   reviews           TaskReview[]
   tags              TaskTag[]
   notifications     Notification[]
+  // Phase 2A — docs/architecture/15-task-conversation.md. Exactly one per task, enforced
+  // by the unique constraint on TaskConversation.taskId below.
+  conversation      TaskConversation?
+  auditLogs         AuditLog[]          @relation("AuditLogTask")
 
   @@index([workspaceId])
   @@index([projectId])
@@ -601,12 +609,21 @@ model AuditLog {
   source         AuditSource  @default(UI)
   createdAt      DateTime     @default(now()) @map("created_at")
 
+  // Phase 2A addition — docs/architecture/15-task-conversation.md "Activity feed reuses
+  // the audit log". Nullable/additive: every Phase 1 write path is untouched; call sites
+  // that already know the related task (every task/assignment/review/checklist/comment
+  // mutation) now also pass it, so a task's full activity history is one indexed query
+  // instead of a parallel event-sourcing table.
+  taskId String? @map("task_id")
+
   organization Organization? @relation(fields: [organizationId], references: [id])
   actor        User          @relation(fields: [actorId], references: [id])
+  task         Task?         @relation("AuditLogTask", fields: [taskId], references: [id])
 
   @@index([organizationId])
   @@index([entityType, entityId])
   @@index([actorId])
+  @@index([taskId, createdAt])
   @@map("audit_logs")
 }
 
@@ -628,4 +645,98 @@ model AiInteraction {
   organization Organization? @relation(fields: [organizationId], references: [id])
 
   @@map("ai_interactions")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Phase 2A — Task Conversations (docs/architecture/15-task-conversation.md)
+//
+// Authorization invariant (enforced in code, not by any table here): a user may read or
+// write in a task's conversation if and only if TaskService.canViewTask() says they can
+// view the task itself. These tables carry conversation *content*, never a competing
+// membership/authorization source — there is deliberately no "conversation_members"
+// table (see doc 15 for why).
+// ─────────────────────────────────────────────────────────────────────────
+
+// Exactly one per task — the unique `taskId` is what makes "no duplicate primary
+// conversations" a database guarantee, not just an application convention.
+model TaskConversation {
+  id             String   @id @default(uuid())
+  taskId         String   @unique @map("task_id")
+  organizationId String?  @map("organization_id") // denormalized from task.workspace, query convenience only — never authoritative
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  task     Task                  @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  messages TaskMessage[]
+  reads    TaskConversationRead[]
+
+  @@map("task_conversations")
+}
+
+// Always human-authored (see NotificationService/AuditLog for system-generated events —
+// doc 15 "system activity is never a fake TaskMessage row").
+model TaskMessage {
+  id                String    @id @default(uuid())
+  conversationId    String    @map("conversation_id")
+  senderId          String    @map("sender_id")
+  parentMessageId   String?   @map("parent_message_id")
+  body              String
+  isEdited          Boolean   @default(false) @map("is_edited")
+  editedAt          DateTime? @map("edited_at")
+  isDeleted         Boolean   @default(false) @map("is_deleted")
+  deletedAt         DateTime? @map("deleted_at")
+  createdAt         DateTime  @default(now()) @map("created_at")
+
+  conversation    TaskConversation      @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sender          User                  @relation(fields: [senderId], references: [id])
+  parentMessage   TaskMessage?          @relation("MessageReplies", fields: [parentMessageId], references: [id])
+  replies         TaskMessage[]         @relation("MessageReplies")
+  mentions        TaskMessageMention[]
+  reactions       TaskMessageReaction[]
+
+  @@index([conversationId, createdAt])
+  @@index([parentMessageId])
+  @@map("task_messages")
+}
+
+model TaskMessageMention {
+  id               String   @id @default(uuid())
+  messageId        String   @map("message_id")
+  mentionedUserId  String   @map("mentioned_user_id")
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  message       TaskMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  mentionedUser User        @relation(fields: [mentionedUserId], references: [id])
+
+  @@unique([messageId, mentionedUserId])
+  @@index([mentionedUserId])
+  @@map("task_message_mentions")
+}
+
+// Normalized (one row per user+emoji), not a JSON blob on the message — doc 15 §Reactions.
+model TaskMessageReaction {
+  id        String   @id @default(uuid())
+  messageId String   @map("message_id")
+  userId    String   @map("user_id")
+  emoji     String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  message TaskMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  user    User        @relation(fields: [userId], references: [id])
+
+  @@unique([messageId, userId, emoji])
+  @@map("task_message_reactions")
+}
+
+// Single last-read cursor per (conversation, user) — deliberately not a per-message read
+// row per user (doc 15 §Unread state: "simpler cursor model is sufficient").
+model TaskConversationRead {
+  conversationId String   @map("conversation_id")
+  userId         String   @map("user_id")
+  lastReadAt     DateTime @map("last_read_at")
+
+  conversation TaskConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  user         User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([conversationId, userId])
+  @@map("task_conversation_reads")
 }

@@ -1,11 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { useWorkspace } from "@/lib/workspace-context";
 import { api, ApiError } from "@/lib/api-client";
 import { StatusBadge, PriorityBadge } from "@/components/TaskCard";
-import { AssignmentChain } from "@/components/AssignmentChain";
+import { ConversationTab } from "@/components/task-detail/ConversationTab";
+import { ActivityTab } from "@/components/task-detail/ActivityTab";
 
 interface PersonRef {
   id: string;
@@ -45,12 +46,6 @@ interface TaskDetail {
   assignments: Assignment[];
   workspace: { type: "PERSONAL" | "ORGANIZATION"; organizationId: string | null };
 }
-interface Comment {
-  id: string;
-  body: string;
-  createdAt: string;
-  user: PersonRef;
-}
 interface Team {
   id: string;
   name: string;
@@ -60,34 +55,44 @@ interface Member {
   user: PersonRef;
 }
 
+const TABS = ["Overview", "Conversation", "Checklist", "Activity"] as const;
+type Tab = (typeof TABS)[number];
+
 export default function TaskDetailPage() {
   const { taskId } = useParams<{ taskId: string }>();
   const router = useRouter();
   const { me, currentOrg } = useWorkspace();
 
   const [task, setTask] = useState<TaskDetail | null>(null);
-  const [comments, setComments] = useState<Comment[]>([]);
   const [teams, setTeams] = useState<Team[]>([]);
   const [members, setMembers] = useState<Member[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [tab, setTab] = useState<Tab>("Overview");
+  const [unreadCount, setUnreadCount] = useState(0);
 
   const load = useCallback(async () => {
     try {
-      const [t, c] = await Promise.all([
-        api.get<TaskDetail>(`/api/v1/tasks/${taskId}`),
-        api.get<Comment[]>(`/api/v1/tasks/${taskId}/comments`),
-      ]);
+      const t = await api.get<TaskDetail>(`/api/v1/tasks/${taskId}`);
       setTask(t);
-      setComments(c);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Could not load task");
     }
   }, [taskId]);
 
+  const refreshUnread = useCallback(async () => {
+    try {
+      const conv = await api.get<{ unreadCount: number }>(`/api/v1/tasks/${taskId}/conversation`);
+      setUnreadCount(conv.unreadCount);
+    } catch {
+      // non-critical — the badge just won't show
+    }
+  }, [taskId]);
+
   useEffect(() => {
     load();
-  }, [load]);
+    refreshUnread();
+  }, [load, refreshUnread]);
 
   useEffect(() => {
     if (!currentOrg) return;
@@ -95,13 +100,29 @@ export default function TaskDetailPage() {
     api.get<Member[]>(`/api/v1/organizations/${currentOrg.organizationId}/members`).then(setMembers).catch(() => {});
   }, [currentOrg]);
 
+  // Candidate @mention targets: task creator + everyone who has ever appeared in the
+  // assignment chain. A reasonable UI proxy for "has task access" (see doc 15) — the
+  // server independently re-validates every mention against canViewTask regardless of
+  // what this list suggests, so an omission here is a UX gap, never a security one.
+  const mentionCandidates = useMemo<PersonRef[]>(() => {
+    if (!task || !me) return [];
+    const map = new Map<string, PersonRef>();
+    map.set(task.createdBy.id, task.createdBy);
+    for (const a of task.assignments) {
+      if (a.assigneeUser) map.set(a.assigneeUser.id, a.assigneeUser);
+      map.set(a.assignedBy.id, a.assignedBy);
+      if (a.respondedBy) map.set(a.respondedBy.id, a.respondedBy);
+    }
+    map.delete(me.id);
+    return [...map.values()];
+  }, [task, me]);
+
   if (error) return <div className="text-red-600">{error}</div>;
   if (!task || !me) return <div className="text-slate-400">Loading…</div>;
 
   const current = task.assignments.find((a) => a.isCurrent) ?? null;
   const isCurrentIndividualAssignee = current?.assigneeType === "USER" && current.assigneeUser?.id === me.id;
   const currentTeam = current?.assigneeType === "TEAM" ? teams.find((t) => t.id === current.assigneeTeam?.id) : undefined;
-  const isHeadOfCurrentTeam = !!currentTeam?.members.find((m) => m.userId === me.id && m.isHead);
   const isReviewer = !!current && current.assignedBy.id === me.id;
   const isCreatorOrOriginAssignor = task.createdBy.id === me.id || task.originAssignor?.id === me.id;
 
@@ -119,12 +140,12 @@ export default function TaskDetailPage() {
   }
 
   return (
-    <div className="mx-auto max-w-3xl space-y-6">
+    <div className="mx-auto max-w-3xl space-y-4">
       <button onClick={() => router.back()} className="text-sm text-slate-500 hover:underline">
         ← Back
       </button>
 
-      <div className="card space-y-4 p-6">
+      <div className="card space-y-2 p-6">
         <div className="flex items-start justify-between gap-4">
           <div>
             <h1 className="text-xl font-semibold text-slate-900">{task.title}</h1>
@@ -138,99 +159,128 @@ export default function TaskDetailPage() {
             <StatusBadge status={task.status} />
           </div>
         </div>
-
-        {task.description && <p className="whitespace-pre-wrap text-sm text-slate-700">{task.description}</p>}
-
-        {(task.originOrganization || task.originTeam) && (
-          <div className="rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-500">
-            Origin: {task.originOrganization?.name}
-            {task.originDepartment && ` / ${task.originDepartment.name}`}
-            {task.originTeam && ` / ${task.originTeam.name}`}
-            {task.originAssignor && ` · assigned by ${task.originAssignor.fullName}`}
-          </div>
-        )}
-
-        {isCreatorOrOriginAssignor && !["COMPLETED", "CANCELLED"].includes(task.status) && (
-          <button
-            className="btn-danger text-xs"
-            disabled={busy}
-            onClick={() => run(() => api.delete(`/api/v1/tasks/${task.id}`))}
-          >
-            Cancel task
-          </button>
-        )}
       </div>
 
-      {/* Assignment / acknowledgement actions */}
-      {current?.status === "PENDING_ACKNOWLEDGEMENT" && (current.assigneeUser?.id === me.id || current.assigneeType === "TEAM") && (
-        <AcknowledgementPanel
-          assignmentId={current.id}
-          isTeam={current.assigneeType === "TEAM"}
-          busy={busy}
-          onAccept={() => run(() => api.post(`/api/v1/assignments/${current.id}/accept`))}
-          onDecline={(reason) => run(() => api.post(`/api/v1/assignments/${current.id}/decline`, { reason }))}
-        />
-      )}
+      <div className="flex gap-1 border-b border-slate-200">
+        {TABS.map((t) => (
+          <button
+            key={t}
+            onClick={() => setTab(t)}
+            className={`relative border-b-2 px-3 py-2 text-sm font-medium ${
+              tab === t ? "border-brand-600 text-brand-700" : "border-transparent text-slate-500 hover:text-slate-700"
+            }`}
+          >
+            {t}
+            {t === "Conversation" && unreadCount > 0 && (
+              <span className="ml-1.5 rounded-full bg-red-500 px-1.5 py-0.5 text-[10px] font-semibold text-white">
+                {unreadCount}
+              </span>
+            )}
+          </button>
+        ))}
+      </div>
 
-      {current?.assigneeType === "TEAM" && current.status === "ACCEPTED" && (isHeadOfCurrentTeam || true) && (
-        <InternalAssignPanel
-          members={members.filter((m) => currentTeam?.members.some((tm) => tm.userId === m.user.id))}
-          busy={busy}
-          onAssign={(userId) => run(() => api.post(`/api/v1/assignments/${current.id}/reassign-internal`, { assigneeUserId: userId }))}
-        />
-      )}
+      {error && <p className="text-sm text-red-600">{error}</p>}
 
-      {isCurrentIndividualAssignee && ["IN_PROGRESS", "CHANGES_REQUESTED"].includes(task.status) && (
-        <ProgressPanel
-          busy={busy}
-          onUpdate={(percentage, note) => run(() => api.post(`/api/v1/tasks/${task.id}/updates`, { percentage, note }))}
-          onSubmit={() => run(() => api.post(`/api/v1/tasks/${task.id}/submit`))}
-        />
-      )}
+      {tab === "Overview" && (
+        <div className="space-y-4">
+          <div className="card space-y-3 p-6">
+            {task.description && <p className="whitespace-pre-wrap text-sm text-slate-700">{task.description}</p>}
 
-      {isReviewer && ["SUBMITTED", "UNDER_REVIEW"].includes(task.status) && (
-        <ReviewPanel
-          busy={busy}
-          onDecide={(decision, notes) => run(() => api.post(`/api/v1/tasks/${task.id}/reviews`, { decision, notes }))}
-        />
-      )}
+            {(task.originOrganization || task.originTeam) && (
+              <div className="rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-500">
+                Origin: {task.originOrganization?.name}
+                {task.originDepartment && ` / ${task.originDepartment.name}`}
+                {task.originTeam && ` / ${task.originTeam.name}`}
+                {task.originAssignor && ` · assigned by ${task.originAssignor.fullName}`}
+              </div>
+            )}
 
-      {task.workspace.type === "ORGANIZATION" && task.status === "UNASSIGNED" && (
-        <AssignPanel
-          members={members}
-          teams={teams}
-          busy={busy}
-          onAssign={(type, id) => run(() => api.post(`/api/v1/tasks/${task.id}/assignments`, { assigneeType: type, [type === "USER" ? "assigneeUserId" : "assigneeTeamId"]: id }))}
-        />
-      )}
-
-      {/* Checklist */}
-      {task.checklistItems.length > 0 && (
-        <div className="card p-4">
-          <h2 className="mb-3 text-sm font-semibold text-slate-700">Checklist</h2>
-          <div className="space-y-1">
-            {task.checklistItems.map((item) => (
-              <label key={item.id} className="flex items-center gap-2 text-sm text-slate-700">
-                <input
-                  type="checkbox"
-                  checked={item.isDone}
-                  onChange={(e) => run(() => api.patch(`/api/v1/checklist-items/${item.id}`, { isDone: e.target.checked }))}
-                />
-                <span className={item.isDone ? "text-slate-400 line-through" : ""}>{item.label}</span>
-              </label>
-            ))}
+            {isCreatorOrOriginAssignor && !["COMPLETED", "CANCELLED"].includes(task.status) && (
+              <button
+                className="btn-danger text-xs"
+                disabled={busy}
+                onClick={() => run(() => api.delete(`/api/v1/tasks/${task.id}`))}
+              >
+                Cancel task
+              </button>
+            )}
           </div>
+
+          {current?.status === "PENDING_ACKNOWLEDGEMENT" && (current.assigneeUser?.id === me.id || current.assigneeType === "TEAM") && (
+            <AcknowledgementPanel
+              isTeam={current.assigneeType === "TEAM"}
+              busy={busy}
+              onAccept={() => run(() => api.post(`/api/v1/assignments/${current.id}/accept`))}
+              onDecline={(reason) => run(() => api.post(`/api/v1/assignments/${current.id}/decline`, { reason }))}
+            />
+          )}
+
+          {current?.assigneeType === "TEAM" && current.status === "ACCEPTED" && (
+            <InternalAssignPanel
+              members={members.filter((m) => currentTeam?.members.some((tm) => tm.userId === m.user.id))}
+              busy={busy}
+              onAssign={(userId) => run(() => api.post(`/api/v1/assignments/${current.id}/reassign-internal`, { assigneeUserId: userId }))}
+            />
+          )}
+
+          {isCurrentIndividualAssignee && ["IN_PROGRESS", "CHANGES_REQUESTED"].includes(task.status) && (
+            <ProgressPanel
+              busy={busy}
+              onUpdate={(percentage, note) => run(() => api.post(`/api/v1/tasks/${task.id}/updates`, { percentage, note }))}
+              onSubmit={() => run(() => api.post(`/api/v1/tasks/${task.id}/submit`))}
+            />
+          )}
+
+          {isReviewer && ["SUBMITTED", "UNDER_REVIEW"].includes(task.status) && (
+            <ReviewPanel
+              busy={busy}
+              onDecide={(decision, notes) => run(() => api.post(`/api/v1/tasks/${task.id}/reviews`, { decision, notes }))}
+            />
+          )}
+
+          {task.workspace.type === "ORGANIZATION" && task.status === "UNASSIGNED" && (
+            <AssignPanel
+              members={members}
+              teams={teams}
+              busy={busy}
+              onAssign={(type, id) => run(() => api.post(`/api/v1/tasks/${task.id}/assignments`, { assigneeType: type, [type === "USER" ? "assigneeUserId" : "assigneeTeamId"]: id }))}
+            />
+          )}
         </div>
       )}
 
-      {/* Assignment chain / lineage */}
-      <div className="card p-4">
-        <h2 className="mb-3 text-sm font-semibold text-slate-700">Assignment history</h2>
-        <AssignmentChain assignments={task.assignments} />
-      </div>
+      {tab === "Conversation" && (
+        <ConversationTab
+          taskId={task.id}
+          currentUserId={me.id}
+          mentionCandidates={mentionCandidates}
+          onActivity={refreshUnread}
+        />
+      )}
 
-      {/* Comments */}
-      <CommentsPanel comments={comments} onAdd={(body) => run(() => api.post(`/api/v1/tasks/${task.id}/comments`, { body }))} />
+      {tab === "Checklist" && (
+        <div className="card p-4">
+          {task.checklistItems.length === 0 ? (
+            <p className="text-sm text-slate-400">No checklist items yet.</p>
+          ) : (
+            <div className="space-y-1">
+              {task.checklistItems.map((item) => (
+                <label key={item.id} className="flex items-center gap-2 text-sm text-slate-700">
+                  <input
+                    type="checkbox"
+                    checked={item.isDone}
+                    onChange={(e) => run(() => api.patch(`/api/v1/checklist-items/${item.id}`, { isDone: e.target.checked }))}
+                  />
+                  <span className={item.isDone ? "text-slate-400 line-through" : ""}>{item.label}</span>
+                </label>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {tab === "Activity" && <ActivityTab taskId={task.id} assignments={task.assignments} />}
     </div>
   );
 }
@@ -241,7 +291,6 @@ function AcknowledgementPanel({
   onAccept,
   onDecline,
 }: {
-  assignmentId: string;
   isTeam: boolean;
   busy: boolean;
   onAccept: () => void;
@@ -409,38 +458,6 @@ function ReviewPanel({ busy, onDecide }: { busy: boolean; onDecide: (decision: "
         </button>
         <button className="btn-secondary" disabled={busy} onClick={() => onDecide("CHANGES_REQUESTED", notes)}>
           Request changes
-        </button>
-      </div>
-    </div>
-  );
-}
-
-function CommentsPanel({ comments, onAdd }: { comments: Comment[]; onAdd: (body: string) => void }) {
-  const [body, setBody] = useState("");
-  return (
-    <div className="card p-4">
-      <h2 className="mb-3 text-sm font-semibold text-slate-700">Comments</h2>
-      <div className="mb-3 space-y-3">
-        {comments.map((c) => (
-          <div key={c.id} className="text-sm">
-            <span className="font-medium text-slate-800">{c.user.fullName}</span>{" "}
-            <span className="text-xs text-slate-400">{new Date(c.createdAt).toLocaleString()}</span>
-            <p className="text-slate-600">{c.body}</p>
-          </div>
-        ))}
-        {comments.length === 0 && <p className="text-sm text-slate-400">No comments yet.</p>}
-      </div>
-      <div className="flex gap-2">
-        <input className="input" placeholder="Add a comment…" value={body} onChange={(e) => setBody(e.target.value)} />
-        <button
-          className="btn-secondary shrink-0"
-          disabled={!body.trim()}
-          onClick={() => {
-            onAdd(body.trim());
-            setBody("");
-          }}
-        >
-          Post
         </button>
       </div>
     </div>

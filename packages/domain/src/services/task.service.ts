@@ -104,6 +104,15 @@ export class TaskService {
         });
       }
 
+      // Phase 2A: every task gets exactly one primary conversation, created in the same
+      // transaction as the task itself (docs/architecture/15-task-conversation.md) — never
+      // lazily, so "duplicate primary conversation" isn't a race condition to guard
+      // against elsewhere. The unique constraint on TaskConversation.taskId is the
+      // database-level backstop for this invariant.
+      await tx.taskConversation.create({
+        data: { taskId: created.id, organizationId: workspace.organizationId ?? null },
+      });
+
       const txAudit = new AuditService(tx);
       await txAudit.log({
         organizationId: workspace.organizationId ?? null,
@@ -111,6 +120,7 @@ export class TaskService {
         action: "task.created",
         entityType: "Task",
         entityId: created.id,
+        taskId: created.id,
         after: { title: created.title, workspaceId: created.workspaceId },
       });
 
@@ -156,40 +166,58 @@ export class TaskService {
    * assignment chain (assignor, responder, or current assignee/current-assignee's-team
    * member), or hold reports.view / audit.view over its current team/department.
    * Personal-workspace tasks are visible only to their owner.
+   *
+   * Public and reusable by design (docs/architecture/15-task-conversation.md): this is
+   * the single authorization surface for "does userId have legitimate access to this
+   * task" — Phase 2A's ConversationService calls this exact method (for both the acting
+   * user and, when validating an @mention, the mentioned user) rather than re-deriving
+   * task access from the assignment/team model a second time.
    */
-  private async canView(actorId: string, task: TaskWithDetail): Promise<boolean> {
+  async canViewTask(userId: string, task: TaskWithDetail): Promise<boolean> {
     if (task.workspace.type === "PERSONAL") {
-      return task.workspace.ownerUserId === actorId;
+      return task.workspace.ownerUserId === userId;
     }
     const organizationId = task.workspace.organizationId!;
-    if (!(await this.permissions.isOrgMember(actorId, organizationId))) return false;
-    if (task.createdById === actorId) return true;
+    if (!(await this.permissions.isOrgMember(userId, organizationId))) return false;
+    if (task.createdById === userId) return true;
 
     const current = task.assignments.find((a) => a.isCurrent);
     for (const a of task.assignments) {
-      if (a.assignedById === actorId || a.respondedById === actorId) return true;
+      if (a.assignedById === userId || a.respondedById === userId) return true;
     }
     if (current) {
-      if (current.assigneeType === "USER" && current.assigneeUserId === actorId) return true;
+      if (current.assigneeType === "USER" && current.assigneeUserId === userId) return true;
       if (current.assigneeType === "TEAM") {
         const membership = await this.db.teamMember.findUnique({
-          where: { teamId_userId: { teamId: current.assigneeTeamId!, userId: actorId } },
+          where: { teamId_userId: { teamId: current.assigneeTeamId!, userId } },
         });
         if (membership) return true;
       }
     }
     const teamId = current?.assigneeTeamId ?? task.originTeamId ?? null;
     const departmentId = task.originDepartmentId ?? null;
-    if (await this.permissions.can(actorId, organizationId, PERMISSIONS.REPORTS_VIEW, { teamId, departmentId })) {
+    if (await this.permissions.can(userId, organizationId, PERMISSIONS.REPORTS_VIEW, { teamId, departmentId })) {
       return true;
     }
     return false;
   }
 
+  /**
+   * Loads a task by id with NO authorization check — existence only. For callers (Phase
+   * 2A's ConversationService) that need to apply their own, deliberately different access
+   * rule on top rather than canViewTask's — see doc 15 for exactly which rule differs and
+   * why. Never call this from a route handler directly; it has no authorization built in.
+   */
+  async getTaskRawByIdOrThrow(taskId: string): Promise<TaskWithDetail> {
+    const task = await this.db.task.findUnique({ where: { id: taskId }, include: TASK_DETAIL_INCLUDE });
+    if (!task) throw new NotFoundError("Task not found");
+    return task;
+  }
+
   async getTaskByIdOrThrow(actorId: string, taskId: string): Promise<TaskWithDetail> {
     const task = await this.db.task.findUnique({ where: { id: taskId }, include: TASK_DETAIL_INCLUDE });
     if (!task) throw new NotFoundError("Task not found");
-    if (!(await this.canView(actorId, task))) throw new ForbiddenError("You cannot view this task");
+    if (!(await this.canViewTask(actorId, task))) throw new ForbiddenError("You cannot view this task");
     return task;
   }
 
@@ -358,6 +386,7 @@ export class TaskService {
       action: "task.updated",
       entityType: "Task",
       entityId: taskId,
+      taskId,
       before,
       after: input,
     });
@@ -387,6 +416,7 @@ export class TaskService {
       action: "task.cancelled",
       entityType: "Task",
       entityId: taskId,
+      taskId,
       before: { status: task.status },
       after: { status: newStatus },
       reason,
@@ -409,6 +439,7 @@ export class TaskService {
       action: "task.checklist_item_added",
       entityType: "TaskChecklistItem",
       entityId: item.id,
+      taskId,
       after: { label: input.label },
     });
     return item;
@@ -430,6 +461,7 @@ export class TaskService {
       action: "task.checklist_item_updated",
       entityType: "TaskChecklistItem",
       entityId: itemId,
+      taskId,
       before: { isDone: item.isDone },
       after: { isDone: updated.isDone },
     });
@@ -446,6 +478,7 @@ export class TaskService {
       action: "task.checklist_item_deleted",
       entityType: "TaskChecklistItem",
       entityId: itemId,
+      taskId,
     });
   }
 
@@ -464,6 +497,7 @@ export class TaskService {
       action: "task.comment_added",
       entityType: "TaskComment",
       entityId: comment.id,
+      taskId,
     });
 
     // Notify everyone else currently touching the task (creator + current assignee).
@@ -520,6 +554,7 @@ export class TaskService {
       action: "task.progress_update_added",
       entityType: "TaskUpdate",
       entityId: update.id,
+      taskId,
       after: { percentage: input.percentage },
     });
 
@@ -555,6 +590,7 @@ export class TaskService {
       action: "task.submitted",
       entityType: "Task",
       entityId: taskId,
+      taskId,
       before: { status: task.status },
       after: { status: newStatus },
     });
@@ -615,6 +651,7 @@ export class TaskService {
       action: input.decision === "APPROVED" ? "task.approved" : "task.changes_requested",
       entityType: "Task",
       entityId: taskId,
+      taskId,
       before: { status: task.status },
       after: { status: newStatus },
       reason: input.notes ?? undefined,

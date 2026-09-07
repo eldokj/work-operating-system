@@ -98,6 +98,30 @@ export function withAuth<T>(handler: AuthedHandler<T>) {
   };
 }
 
+type AuthedRawHandler = (req: NextRequest, ctx: { userId: string; params: RouteParams }) => Promise<NextResponse>;
+
+/**
+ * Same auth pipeline as withAuth, but for the rare route that must return something other
+ * than the JSON envelope — Phase 2B's secure file retrieval (binary body + Content-Type/
+ * Content-Disposition headers, or a redirect to a signed URL) is the only current user.
+ * The handler builds and returns the NextResponse itself; everything else (session check,
+ * error mapping) is identical to withAuth.
+ */
+export function withAuthRaw(handler: AuthedRawHandler) {
+  return async (req: NextRequest, routeCtx: RouteContext) => {
+    try {
+      const userId = await getSessionUserId();
+      if (!userId) {
+        return NextResponse.json(fail(ErrorCodes.UNAUTHENTICATED, "Not signed in"), { status: 401 });
+      }
+      const params = routeCtx?.params ? await routeCtx.params : {};
+      return await handler(req, { userId, params });
+    } catch (error) {
+      return mapErrorToResponse(error);
+    }
+  };
+}
+
 type PublicHandler<T> = (req: NextRequest, ctx: { params: RouteParams }) => Promise<T>;
 
 /** Wraps a route handler that must NOT require a session (signup, login). See withAuth's note on `routeCtx`. */

@@ -1,6 +1,8 @@
 export * from "./errors";
+export * from "./attachment-policy";
 export * from "./permission-engine/resolve-scope";
 export * from "./permission-engine/assignment-authorization";
+export * from "./permission-engine/conversation-access";
 export * from "./state-machines/task-status.machine";
 export * from "./state-machines/assignment-status.machine";
 
@@ -12,6 +14,7 @@ export * from "./services/assignment.service";
 export * from "./services/reporting.service";
 export * from "./services/conversation.service";
 export * from "./services/task-activity.service";
+export * from "./services/task-attachment.service";
 export * from "./services/notification.service";
 export * from "./services/audit.service";
 export * from "./services/storage.service";

@@ -501,22 +501,34 @@ model TaskUpdate {
   @@map("task_updates")
 }
 
+// Phase 2B — docs/architecture/16-work-files-attachments.md. This model predates Phase 2B
+// (seeded in the original doc 03 schema, never wired to any service/route/UI until now) —
+// extended here rather than replaced, per that phase's instruction to reuse an existing
+// attachment concept if one exists. `commentId` is the pre-existing, still-untouched link
+// to the old TaskComment feature; `messageId` is the new Phase 2A TaskMessage link. Binary
+// content is never stored here — `storagePath` is an opaque, server-generated key into the
+// StorageService, never a client-supplied path or the original filename.
 model TaskAttachment {
-  id           String   @id @default(uuid())
-  taskId       String   @map("task_id")
-  commentId    String?  @map("comment_id")
-  uploadedById String   @map("uploaded_by")
-  storagePath  String   @map("storage_path")
-  fileName     String   @map("file_name")
-  mimeType     String   @map("mime_type")
-  sizeBytes    BigInt   @map("size_bytes")
-  createdAt    DateTime @default(now()) @map("created_at")
+  id           String    @id @default(uuid())
+  taskId       String    @map("task_id")
+  commentId    String?   @map("comment_id")
+  messageId    String?   @map("message_id")
+  uploadedById String    @map("uploaded_by")
+  storagePath  String    @map("storage_path")
+  fileName     String    @map("file_name")
+  mimeType     String    @map("mime_type")
+  sizeBytes    BigInt    @map("size_bytes")
+  isDeleted    Boolean   @default(false) @map("is_deleted")
+  deletedAt    DateTime? @map("deleted_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
 
   task       Task         @relation(fields: [taskId], references: [id], onDelete: Cascade)
   comment    TaskComment? @relation(fields: [commentId], references: [id])
+  message    TaskMessage? @relation(fields: [messageId], references: [id], onDelete: SetNull)
   uploadedBy User         @relation(fields: [uploadedById], references: [id])
 
-  @@index([taskId])
+  @@index([taskId, createdAt])
+  @@index([messageId])
   @@map("task_attachments")
 }
 
@@ -692,6 +704,7 @@ model TaskMessage {
   replies         TaskMessage[]         @relation("MessageReplies")
   mentions        TaskMessageMention[]
   reactions       TaskMessageReaction[]
+  attachments     TaskAttachment[]
 
   @@index([conversationId, createdAt])
   @@index([parentMessageId])

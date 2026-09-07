@@ -6,6 +6,7 @@ import { useWorkspace } from "@/lib/workspace-context";
 import { api, ApiError } from "@/lib/api-client";
 import { StatusBadge, PriorityBadge } from "@/components/TaskCard";
 import { ConversationTab } from "@/components/task-detail/ConversationTab";
+import { FilesTab } from "@/components/task-detail/FilesTab";
 import { ActivityTab } from "@/components/task-detail/ActivityTab";
 
 interface PersonRef {
@@ -55,7 +56,7 @@ interface Member {
   user: PersonRef;
 }
 
-const TABS = ["Overview", "Conversation", "Checklist", "Activity"] as const;
+const TABS = ["Overview", "Conversation", "Checklist", "Files", "Activity"] as const;
 type Tab = (typeof TABS)[number];
 
 export default function TaskDetailPage() {
@@ -279,6 +280,8 @@ export default function TaskDetailPage() {
           )}
         </div>
       )}
+
+      {tab === "Files" && <FilesTab taskId={task.id} />}
 
       {tab === "Activity" && <ActivityTab taskId={task.id} assignments={task.assignments} />}
     </div>

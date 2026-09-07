@@ -653,4 +653,263 @@ describe("ABC College — full Phase 1 acceptance scenario (brief §32/33)", () 
       expect(rahulMyTasks.data!.some((t) => t.id === convTaskId)).toBe(false);
     });
   });
+
+  // ── Phase 2B: Work Files & Attachments — brief "Work Files & Attachments" ──
+  // Fresh task, same Management -> Marketing Team -> Anu -> Rahul chain, so these tests
+  // never depend on Phase 2A test block's leftover state.
+
+  describe("Phase 2B: Work Files & Attachments", () => {
+    let filesTaskId: string;
+    let filesTeamAssignmentId: string;
+    let firstAttachmentId: string;
+    let secondAttachmentId: string;
+    let messageWithAttachmentId: string;
+
+    const textFile = (name: string, contents: string) => ({ fileName: name, mimeType: "text/plain", data: Buffer.from(contents) });
+    const pngFile = (name: string) => ({
+      fileName: name,
+      mimeType: "image/png",
+      // Minimal valid-enough PNG header bytes — validation only checks declared MIME +
+      // extension consistency, not real image decoding (doc 16 — no image-processing
+      // pipeline in Phase 2B).
+      data: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    });
+
+    it("sets up a task routed to Rahul via Marketing Team, mirroring the main scenario", async () => {
+      const created = await eldo.client.post<{ id: string }>("/api/v1/tasks", {
+        workspaceId: orgWorkspaceId,
+        title: "Prepare the annual day banner assets",
+        priority: "MEDIUM",
+      });
+      filesTaskId = created.data!.id;
+
+      const assign = await eldo.client.post(`/api/v1/tasks/${filesTaskId}/assignments`, {
+        assigneeType: "TEAM",
+        assigneeTeamId: marketingTeamId,
+      });
+      expect(assign.status, JSON.stringify(assign)).toBe(200);
+      const task = await eldo.client.get<{ assignments: Array<{ id: string; isCurrent: boolean }> }>(`/api/v1/tasks/${filesTaskId}`);
+      filesTeamAssignmentId = task.data!.assignments.find((a) => a.isCurrent)!.id;
+    });
+
+    it("15. team assignment does NOT grant Files/upload access to a plain member while team-pending", async () => {
+      await anu.client.post(`/api/v1/assignments/${filesTeamAssignmentId}/accept`);
+
+      // Divya is a plain Marketing member — the team accepted, but nothing has been
+      // distributed to an individual yet. Same narrowing as Phase 2A's conversation rule
+      // (doc 16 §Authorization: attachment access follows conversation access here).
+      const divyaList = await divya.client.get(`/api/v1/tasks/${filesTaskId}/attachments`);
+      expect(divyaList.status).toBe(403);
+
+      const divyaUpload = await divya.client.uploadFiles(`/api/v1/tasks/${filesTaskId}/attachments`, [textFile("sneaky.txt", "hi")]);
+      expect(divyaUpload.status).toBe(403);
+
+      // Anu (the Head who accepted) DOES have task-level access already.
+      const anuList = await anu.client.get(`/api/v1/tasks/${filesTaskId}/attachments`);
+      expect(anuList.status, JSON.stringify(anuList)).toBe(200);
+    });
+
+    it("distributes to Rahul and he accepts", async () => {
+      const reassign = await anu.client.post<{ id: string }>(`/api/v1/assignments/${filesTeamAssignmentId}/reassign-internal`, {
+        assigneeUserId: rahul.id,
+      });
+      await rahul.client.post(`/api/v1/assignments/${reassign.data!.id}/accept`);
+      const task = await rahul.client.get<{ status: string }>(`/api/v1/tasks/${filesTaskId}`);
+      expect(task.data!.status).toBe("IN_PROGRESS");
+    });
+
+    it("1. an authorized user (Rahul, current assignee) uploads an attachment", async () => {
+      const res = await rahul.client.uploadFiles<Array<{ id: string; fileName: string; mimeType: string; sizeBytes: number }>>(
+        `/api/v1/tasks/${filesTaskId}/attachments`,
+        [textFile("notes.txt", "banner notes")]
+      );
+      expect(res.status, JSON.stringify(res)).toBe(200);
+      expect(res.data).toHaveLength(1);
+      expect(res.data![0]!.fileName).toBe("notes.txt");
+      expect(res.data![0]!.mimeType).toBe("text/plain");
+      expect(res.data![0]!.sizeBytes).toBe(Buffer.from("banner notes").byteLength);
+      firstAttachmentId = res.data![0]!.id;
+    });
+
+    it("2. unauthorized user cannot upload", async () => {
+      // Divya still has zero relationship to this task — current assignee is Rahul, an
+      // individual, so the old team-membership grant no longer applies at all.
+      const res = await divya.client.uploadFiles(`/api/v1/tasks/${filesTaskId}/attachments`, [textFile("x.txt", "x")]);
+      expect(res.status).toBe(403);
+    });
+
+    it("3. authorized user can retrieve the attachment", async () => {
+      const res = await rahul.client.getRaw(`/api/v1/attachments/${firstAttachmentId}`);
+      expect(res.status, JSON.stringify(res)).toBe(200);
+      expect(res.body.toString()).toBe("banner notes");
+      expect(res.contentType).toContain("text/plain");
+    });
+
+    it("4. unauthorized user cannot retrieve the attachment", async () => {
+      const res = await divya.client.getRaw(`/api/v1/attachments/${firstAttachmentId}`);
+      expect(res.status).toBe(403);
+    });
+
+    it("5. a random (well-formed but non-existent) attachment UUID does not bypass authorization", async () => {
+      const res = await divya.client.getRaw(`/api/v1/attachments/00000000-0000-4000-8000-000000000000`);
+      expect(res.status).toBe(404);
+    });
+
+    it("6/14. cross-task access: files uploaded to one task do not appear when listing another task's Files", async () => {
+      const otherTask = await eldo.client.post<{ id: string }>("/api/v1/tasks", {
+        workspaceId: orgWorkspaceId,
+        title: "Unrelated task for cross-task isolation check",
+      });
+      const otherList = await eldo.client.get<Array<{ id: string }>>(`/api/v1/tasks/${otherTask.data!.id}/attachments`);
+      expect(otherList.status, JSON.stringify(otherList)).toBe(200);
+      expect(otherList.data!.some((a) => a.id === firstAttachmentId)).toBe(false);
+    });
+
+    it("7. cross-tenant access is denied", async () => {
+      const outsider = await signup("attach-outsider", "Attachment Outsider");
+      const res = await outsider.client.getRaw(`/api/v1/attachments/${firstAttachmentId}`);
+      expect(res.status).toBe(403);
+      const listRes = await outsider.client.get(`/api/v1/tasks/${filesTaskId}/attachments`);
+      expect(listRes.status).toBe(403);
+    });
+
+    it("8. multiple attachments on one message work", async () => {
+      const uploaded = await rahul.client.uploadFiles<Array<{ id: string }>>(`/api/v1/tasks/${filesTaskId}/attachments`, [
+        pngFile("banner-v1.png"),
+        pngFile("banner-v2.png"),
+      ]);
+      expect(uploaded.status, JSON.stringify(uploaded)).toBe(200);
+      expect(uploaded.data).toHaveLength(2);
+
+      const message = await rahul.client.post<{ attachments: Array<{ id: string }> }>(
+        `/api/v1/tasks/${filesTaskId}/conversation/messages`,
+        { body: "Two banner drafts for review.", attachmentIds: uploaded.data!.map((a) => a.id) }
+      );
+      expect(message.status, JSON.stringify(message)).toBe(200);
+      expect(message.data!.attachments).toHaveLength(2);
+      messageWithAttachmentId = uploaded.data![0]!.id;
+      secondAttachmentId = uploaded.data![1]!.id;
+    });
+
+    it("9. text + attachment message works", async () => {
+      const uploaded = await rahul.client.uploadFiles<Array<{ id: string }>>(`/api/v1/tasks/${filesTaskId}/attachments`, [
+        textFile("readme.txt", "context"),
+      ]);
+      const message = await rahul.client.post<{ body: string | null; attachments: Array<{ id: string }> }>(
+        `/api/v1/tasks/${filesTaskId}/conversation/messages`,
+        { body: "Please review this too.", attachmentIds: [uploaded.data![0]!.id] }
+      );
+      expect(message.status, JSON.stringify(message)).toBe(200);
+      expect(message.data!.body).toBe("Please review this too.");
+      expect(message.data!.attachments).toHaveLength(1);
+    });
+
+    it("10. attachment-only message (no text) is valid", async () => {
+      const uploaded = await rahul.client.uploadFiles<Array<{ id: string }>>(`/api/v1/tasks/${filesTaskId}/attachments`, [
+        textFile("attachment-only.txt", "just a file"),
+      ]);
+      const message = await rahul.client.post<{ body: string | null; attachments: Array<{ id: string }> }>(
+        `/api/v1/tasks/${filesTaskId}/conversation/messages`,
+        { attachmentIds: [uploaded.data![0]!.id] }
+      );
+      expect(message.status, JSON.stringify(message)).toBe(200);
+      expect(message.data!.attachments).toHaveLength(1);
+    });
+
+    it("11. existing text-only messages still work (no regression)", async () => {
+      const message = await rahul.client.post<{ body: string | null; attachments: unknown[] }>(
+        `/api/v1/tasks/${filesTaskId}/conversation/messages`,
+        { body: "Just a plain text update, no files." }
+      );
+      expect(message.status, JSON.stringify(message)).toBe(200);
+      expect(message.data!.body).toBe("Just a plain text update, no files.");
+      expect(message.data!.attachments).toHaveLength(0);
+    });
+
+    it("a truly empty message (no text, no attachments) is still rejected", async () => {
+      const message = await rahul.client.post(`/api/v1/tasks/${filesTaskId}/conversation/messages`, {});
+      expect(message.status).toBe(400);
+    });
+
+    it("12. a deleted attachment cannot be retrieved", async () => {
+      const del = await rahul.client.delete(`/api/v1/attachments/${firstAttachmentId}`);
+      expect(del.status, JSON.stringify(del)).toBe(200);
+      const get = await rahul.client.getRaw(`/api/v1/attachments/${firstAttachmentId}`);
+      expect(get.status).toBe(404);
+    });
+
+    it("13. Task Files lists exactly the correct (non-deleted) files for this task", async () => {
+      const res = await rahul.client.get<Array<{ id: string; fileName: string }>>(`/api/v1/tasks/${filesTaskId}/attachments`);
+      expect(res.status, JSON.stringify(res)).toBe(200);
+      const ids = res.data!.map((a) => a.id);
+      expect(ids).not.toContain(firstAttachmentId); // deleted in the previous test
+      expect(ids).toContain(secondAttachmentId);
+      expect(ids).toContain(messageWithAttachmentId);
+    });
+
+    it("message mutation-style rule applies to attachments too: only the uploader can delete", async () => {
+      const res = await anu.client.delete(`/api/v1/attachments/${secondAttachmentId}`);
+      expect(res.status).toBe(403);
+    });
+
+    it("16. reassignment: the new assignee gains access, and an unrelated user still does not", async () => {
+      const reassign = await anu.client.post(`/api/v1/tasks/${filesTaskId}/assignments`, {
+        assigneeType: "USER",
+        assigneeUserId: divya.id,
+      });
+      expect(reassign.status, JSON.stringify(reassign)).toBe(200);
+      const task = await anu.client.get<{ assignments: Array<{ id: string; isCurrent: boolean }> }>(`/api/v1/tasks/${filesTaskId}`);
+      await divya.client.post(`/api/v1/assignments/${task.data!.assignments.find((a) => a.isCurrent)!.id}/accept`);
+
+      const divyaFiles = await divya.client.get(`/api/v1/tasks/${filesTaskId}/attachments`);
+      expect(divyaFiles.status, JSON.stringify(divyaFiles)).toBe(200);
+
+      // Priya (Finance) has never had any relationship to this task at all.
+      const priyaFiles = await priya.client.get(`/api/v1/tasks/${filesTaskId}/attachments`);
+      expect(priyaFiles.status).toBe(403);
+    });
+
+    it("19. an oversized file is rejected", async () => {
+      const oversized = { fileName: "huge.txt", mimeType: "text/plain", data: Buffer.alloc(26 * 1024 * 1024) };
+      const res = await divya.client.uploadFiles(`/api/v1/tasks/${filesTaskId}/attachments`, [oversized]);
+      expect(res.status).toBe(400);
+    });
+
+    it("20. an unsupported/dangerous file type is rejected", async () => {
+      const exe = { fileName: "installer.exe", mimeType: "application/x-msdownload", data: Buffer.from("MZ") };
+      const res = await divya.client.uploadFiles(`/api/v1/tasks/${filesTaskId}/attachments`, [exe]);
+      expect(res.status).toBe(400);
+
+      const script = { fileName: "hack.js", mimeType: "text/plain", data: Buffer.from("alert(1)") };
+      const res2 = await divya.client.uploadFiles(`/api/v1/tasks/${filesTaskId}/attachments`, [script]);
+      expect(res2.status).toBe(400);
+    });
+
+    it("21. an unsafe filename cannot escape the storage root — sanitized on the way back out", async () => {
+      const traversal = { fileName: "../../../etc/passwd.txt", mimeType: "text/plain", data: Buffer.from("attempt") };
+      const res = await divya.client.uploadFiles<Array<{ id: string; fileName: string }>>(
+        `/api/v1/tasks/${filesTaskId}/attachments`,
+        [traversal]
+      );
+      expect(res.status, JSON.stringify(res)).toBe(200);
+      expect(res.data![0]!.fileName).not.toContain("..");
+      expect(res.data![0]!.fileName).not.toContain("/");
+
+      // And retrieval still works correctly — proving the file was stored under a safe,
+      // server-generated key regardless of what the client sent as a filename.
+      const get = await divya.client.getRaw(`/api/v1/attachments/${res.data![0]!.id}`);
+      expect(get.status, JSON.stringify(get)).toBe(200);
+      expect(get.body.toString()).toBe("attempt");
+    });
+
+    it("17/18. Phase 1 and Phase 2A behavior are unaffected", async () => {
+      const original = await eldo.client.get<{ status: string }>(`/api/v1/tasks/${taskId}`);
+      expect(original.data!.status).toBe("COMPLETED");
+      // Divya (reassigned onto filesTaskId in test #16 above) still correctly cannot see
+      // an entirely unrelated task's conversation — the Phase 2A access rule is unaffected
+      // by anything Phase 2B added.
+      const unrelatedConvAccess = await divya.client.get(`/api/v1/tasks/${taskId}/conversation`);
+      expect(unrelatedConvAccess.status).toBe(403);
+    });
+  });
 });

@@ -10,7 +10,11 @@ coverage/
 .turbo/
 playwright-report/
 test-results/
+# `storage/local/` (without a leading `**/`) only matches at the repo root in gitignore
+# semantics — the actual local attachment storage lives under apps/web/ (STORAGE_LOCAL_DIR
+# resolves relative to the Next.js process's cwd), so it needs its own, depth-agnostic entry.
 storage/local/
+**/storage/local/
 npm-debug.log*
 .DS_Store
 Thumbs.db

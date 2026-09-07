@@ -2,9 +2,11 @@ import type { Prisma, PrismaClient } from "@ai-task-manager/db";
 import { PERMISSIONS } from "@ai-task-manager/shared";
 import type { CreateMessageInput, EditMessageInput } from "@ai-task-manager/shared";
 import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from "../errors";
+import { canAccessConversation as canAccessConversationImpl } from "../permission-engine/conversation-access";
 import { AuditService } from "./audit.service";
 import { NotificationService, NotificationType } from "./notification.service";
 import { PermissionService } from "./permission.service";
+import { TaskAttachmentService, type AttachmentDTO } from "./task-attachment.service";
 import { TaskService, type TaskWithDetail } from "./task.service";
 
 const PERSON_SELECT = { id: true, fullName: true, email: true } satisfies Prisma.UserSelect;
@@ -14,6 +16,7 @@ const MESSAGE_INCLUDE = {
   parentMessage: { include: { sender: { select: PERSON_SELECT } } },
   mentions: { include: { mentionedUser: { select: PERSON_SELECT } } },
   reactions: { include: { user: { select: PERSON_SELECT } } },
+  attachments: { where: { isDeleted: false }, include: { uploadedBy: { select: PERSON_SELECT } } },
 } satisfies Prisma.TaskMessageInclude;
 
 type RawMessage = Prisma.TaskMessageGetPayload<{ include: typeof MESSAGE_INCLUDE }>;
@@ -42,52 +45,24 @@ export class ConversationService {
   private readonly permissions: PermissionService;
   private readonly audit: AuditService;
   private readonly notifications: NotificationService;
+  private readonly attachments: TaskAttachmentService;
 
   constructor(private readonly db: PrismaClient) {
     this.tasks = new TaskService(db);
     this.permissions = new PermissionService(db);
     this.audit = new AuditService(db);
     this.notifications = new NotificationService(db);
+    this.attachments = new TaskAttachmentService(db);
   }
 
   /**
-   * Conversation access — deliberately NOT the same as TaskService.canViewTask. Every
-   * other rule is identical (creator, anyone ever in the assignment chain, the current
-   * individual assignee, reports.view holders), reusing exactly those existing checks. The
-   * one narrowing: while the CURRENT assignment targets a TEAM as a whole, canViewTask
-   * grants every team member task visibility (correct, unchanged Phase 1 behavior — the
-   * team needs to see what it's being asked to do before the Head decides), but the
-   * conversation must not be exposed to the whole team just because one member happens to
-   * belong to it (doc 15's Marketing/Rahul example). Only whoever can act on the team's
-   * behalf (PermissionService.canActOnBehalfOfTeam — unchanged, existing) gets conversation
-   * access at that point; plain members gain it once the task is actually distributed to
-   * them individually, exactly like everyone else.
+   * Conversation access — deliberately NOT the same as TaskService.canViewTask. See
+   * ../permission-engine/conversation-access.ts for the full rule and rationale (extracted
+   * there, rather than implemented here, specifically so TaskAttachmentService can reuse it
+   * without a circular dependency between the two services — doc 16).
    */
-  private async canAccessConversation(userId: string, task: TaskWithDetail): Promise<boolean> {
-    if (task.workspace.type === "PERSONAL") {
-      return task.workspace.ownerUserId === userId;
-    }
-    const organizationId = task.workspace.organizationId!;
-    if (!(await this.permissions.isOrgMember(userId, organizationId))) return false;
-    if (task.createdById === userId) return true;
-
-    for (const a of task.assignments) {
-      if (a.assignedById === userId || a.respondedById === userId) return true;
-    }
-
-    const current = task.assignments.find((a) => a.isCurrent);
-    if (current) {
-      if (current.assigneeType === "USER" && current.assigneeUserId === userId) return true;
-      if (current.assigneeType === "TEAM") {
-        if (await this.permissions.canActOnBehalfOfTeam(userId, organizationId, current.assigneeTeamId!)) {
-          return true;
-        }
-      }
-    }
-
-    const teamId = current?.assigneeTeamId ?? task.originTeamId ?? null;
-    const departmentId = task.originDepartmentId ?? null;
-    return this.permissions.can(userId, organizationId, PERMISSIONS.REPORTS_VIEW, { teamId, departmentId });
+  async canAccessConversation(userId: string, task: TaskWithDetail): Promise<boolean> {
+    return canAccessConversationImpl(this.permissions, userId, task);
   }
 
   private async assertCanAccessConversation(userId: string, task: TaskWithDetail): Promise<void> {
@@ -139,6 +114,18 @@ export class ConversationService {
         : null,
       mentions: raw.mentions.map((m) => m.mentionedUser),
       reactions: [...reactionsByEmoji.values()],
+      // Deleted messages hide attachments too, same as they hide body text — a soft-
+      // deleted message's content (text or files) is never returned to clients.
+      attachments: raw.isDeleted
+        ? []
+        : raw.attachments.map((a) => ({
+            id: a.id,
+            fileName: a.fileName,
+            mimeType: a.mimeType,
+            sizeBytes: Number(a.sizeBytes),
+            uploadedBy: a.uploadedBy,
+            createdAt: a.createdAt,
+          })),
     };
   }
 
@@ -221,18 +208,31 @@ export class ConversationService {
       }
     }
 
+    // Same treatment for attachments (doc 16): never trust the client's attachmentIds list
+    // — each must be this task's, this actor's own upload, and not already linked elsewhere.
+    const attachmentIds = [...new Set(input.attachmentIds ?? [])];
+    if (attachmentIds.length) {
+      await this.attachments.assertAttachmentsLinkable(actorId, taskId, attachmentIds);
+    }
+
     const created = await this.db.$transaction(async (tx) => {
       const message = await tx.taskMessage.create({
         data: {
           conversationId: conversation.id,
           senderId: actorId,
           parentMessageId: input.parentMessageId ?? null,
-          body: input.body,
+          body: input.body ?? "",
         },
       });
       if (mentionedUserIds.length) {
         await tx.taskMessageMention.createMany({
           data: mentionedUserIds.map((mentionedUserId) => ({ messageId: message.id, mentionedUserId })),
+        });
+      }
+      if (attachmentIds.length) {
+        await tx.taskAttachment.updateMany({
+          where: { id: { in: attachmentIds }, taskId, uploadedById: actorId, messageId: null },
+          data: { messageId: message.id },
         });
       }
       const txAudit = new AuditService(tx);
@@ -243,7 +243,7 @@ export class ConversationService {
         entityType: "TaskMessage",
         entityId: message.id,
         taskId,
-        after: { parentMessageId: input.parentMessageId ?? null, mentionCount: mentionedUserIds.length },
+        after: { parentMessageId: input.parentMessageId ?? null, mentionCount: mentionedUserIds.length, attachmentCount: attachmentIds.length },
       });
       return message;
     });

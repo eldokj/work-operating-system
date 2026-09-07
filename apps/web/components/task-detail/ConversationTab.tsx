@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "@/lib/api-client";
+import { AttachmentChip, type AttachmentSummary } from "./AttachmentChip";
 
 interface PersonRef {
   id: string;
@@ -25,6 +26,7 @@ interface Message {
   parentMessage: { id: string; body: string | null; isDeleted: boolean; sender: PersonRef } | null;
   mentions: PersonRef[];
   reactions: Reaction[];
+  attachments: AttachmentSummary[];
 }
 
 const QUICK_EMOJIS = ["👍", "❤️", "🎉", "😂", "👀"];
@@ -50,7 +52,10 @@ export function ConversationTab({
   const [selectedMentions, setSelectedMentions] = useState<PersonRef[]>([]);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editBody, setEditBody] = useState("");
+  const [pendingFiles, setPendingFiles] = useState<File[]>([]);
+  const [uploading, setUploading] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   async function load() {
     try {
@@ -74,14 +79,23 @@ export function ConversationTab({
   }, [messages.length]);
 
   async function send() {
-    if (!body.trim()) return;
+    if (!body.trim() && pendingFiles.length === 0) return;
+    setError(null);
     try {
+      let attachmentIds: string[] = [];
+      if (pendingFiles.length > 0) {
+        setUploading(true);
+        const uploaded = await api.uploadFiles<Array<{ id: string }>>(`/api/v1/tasks/${taskId}/attachments`, pendingFiles);
+        attachmentIds = uploaded.map((a) => a.id);
+      }
       await api.post(`/api/v1/tasks/${taskId}/conversation/messages`, {
-        body: body.trim(),
+        body: body.trim() || undefined,
         parentMessageId: replyingTo?.id ?? null,
         mentionedUserIds: selectedMentions.map((m) => m.id),
+        attachmentIds,
       });
       setBody("");
+      setPendingFiles([]);
       setReplyingTo(null);
       setSelectedMentions([]);
       setMentionPickerOpen(false);
@@ -89,7 +103,19 @@ export function ConversationTab({
       onActivity?.();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Could not send message");
+    } finally {
+      setUploading(false);
     }
+  }
+
+  function addFiles(fileList: FileList | null) {
+    if (!fileList) return;
+    setPendingFiles((prev) => [...prev, ...Array.from(fileList)]);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  }
+
+  function removePendingFile(index: number) {
+    setPendingFiles((prev) => prev.filter((_, i) => i !== index));
   }
 
   async function saveEdit(messageId: string) {
@@ -178,6 +204,14 @@ export function ConversationTab({
                   <p className="text-xs text-brand-600">Mentioned: {m.mentions.map((p) => p.fullName).join(", ")}</p>
                 )}
 
+                {!m.isDeleted && m.attachments.length > 0 && (
+                  <div className="mt-1 flex flex-wrap gap-2">
+                    {m.attachments.map((a) => (
+                      <AttachmentChip key={a.id} attachment={a} compact />
+                    ))}
+                  </div>
+                )}
+
                 <div className="mt-1 flex flex-wrap items-center gap-2">
                   {m.reactions.map((r) => (
                     <button
@@ -250,9 +284,41 @@ export function ConversationTab({
             ))}
           </div>
         )}
+        {pendingFiles.length > 0 && (
+          <div className="flex flex-wrap gap-2 rounded bg-slate-50 p-2">
+            {pendingFiles.map((file, i) => (
+              <span key={`${file.name}-${i}`} className="flex items-center gap-1.5 rounded-full border border-slate-200 bg-white py-1 pl-2.5 pr-1 text-xs text-slate-600">
+                {file.name}
+                <button
+                  onClick={() => removePendingFile(i)}
+                  disabled={uploading}
+                  className="flex h-4 w-4 items-center justify-center rounded-full text-slate-400 hover:bg-slate-100 hover:text-slate-600"
+                  title="Remove"
+                >
+                  ✕
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          className="hidden"
+          onChange={(e) => addFiles(e.target.files)}
+        />
         <div className="flex gap-2">
           <button className="btn-secondary shrink-0" onClick={() => setMentionPickerOpen((o) => !o)} title="Mention someone">
             @
+          </button>
+          <button
+            className="btn-secondary shrink-0"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={uploading}
+            title="Attach files"
+          >
+            📎
           </button>
           <input
             className="input"
@@ -266,8 +332,8 @@ export function ConversationTab({
               }
             }}
           />
-          <button className="btn-primary shrink-0" disabled={!body.trim()} onClick={send}>
-            Send
+          <button className="btn-primary shrink-0" disabled={(!body.trim() && pendingFiles.length === 0) || uploading} onClick={send}>
+            {uploading ? "Uploading…" : "Send"}
           </button>
         </div>
       </div>

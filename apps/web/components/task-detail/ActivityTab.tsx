@@ -44,6 +44,8 @@ const ACTION_LABEL: Record<string, string> = {
   "task.message_added": "sent a message",
   "task.message_edited": "edited a message",
   "task.message_deleted": "deleted a message",
+  "attachment.uploaded": "uploaded a file",
+  "attachment.deleted": "deleted a file",
 };
 
 export function ActivityTab({ taskId, assignments }: { taskId: string; assignments: AssignmentRow[] }) {

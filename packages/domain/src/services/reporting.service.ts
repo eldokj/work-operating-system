@@ -1,11 +1,52 @@
 import type { PrismaClient } from "@ai-task-manager/db";
 import { PERMISSIONS, type TaskListFilter } from "@ai-task-manager/shared";
+import { DailyWorkService, type TeamMemberDailySignal } from "./daily-work.service";
 import { ForbiddenError, NotFoundError } from "../errors";
 import { localDayBounds } from "../local-day";
 import { isOverdue } from "../state-machines/task-status.machine";
 import { PermissionService } from "./permission.service";
 import { ProjectService } from "./project.service";
 import { TaskService, type TaskWithDetail } from "./task.service";
+
+// docs/architecture/21-phase4-management-visibility-architecture-report.md §6/§25 — a
+// named, documented MVP default (not yet configurable per organization; §25 leaves the
+// exact value an open product decision, not an architectural one). An assignment is
+// "stuck" once it has sat PENDING_ACKNOWLEDGEMENT longer than this.
+const STUCK_ACKNOWLEDGEMENT_THRESHOLD_MS = 24 * 60 * 60 * 1000;
+
+/** doc 21 §6 — a task's current assignment has been awaiting acknowledgement longer than
+ * the stuck threshold. Computed over an already-loaded task list (no new query) — the
+ * exact same data `unassigned`/`assigned`/etc. buckets already use. Exported for direct
+ * unit testing (doc 21 §20 — metric definitions get their own pure-function tests,
+ * independent of Prisma, matching resolve-scope.test.ts's style). */
+export function isStuckAcknowledgement(
+  task: Pick<TaskWithDetail, "assignments">,
+  now: Date,
+  thresholdMs: number = STUCK_ACKNOWLEDGEMENT_THRESHOLD_MS
+): boolean {
+  const current = task.assignments.find((a) => a.isCurrent);
+  if (!current || current.status !== "PENDING_ACKNOWLEDGEMENT") return false;
+  return now.getTime() - current.createdAt.getTime() > thresholdMs;
+}
+
+/** doc 21 §6/§22 — a small, fixed set of org/team/department-wide totals surfaced as one
+ * "Attention Required" summary, never a full BI breakdown (doc 21 §12/§22's explicit
+ * scope boundary). */
+export interface AttentionRequiredSummary {
+  stuckAcknowledgementCount: number;
+  overCapacityCount: number;
+  carryForwardRepeatCount: number;
+  unplannedCount: number;
+}
+
+export function summarizeAttention(stuckCount: number, signals: TeamMemberDailySignal[]): AttentionRequiredSummary {
+  return {
+    stuckAcknowledgementCount: stuckCount,
+    overCapacityCount: signals.filter((s) => s.overCapacity).length,
+    carryForwardRepeatCount: signals.reduce((sum, s) => sum + s.carryForwardRepeatCount, 0),
+    unplannedCount: signals.reduce((sum, s) => sum + s.unplannedItemCount, 0),
+  };
+}
 
 // "Today" here now means the VIEWING USER's own local calendar day, not the server's
 // clock/zone — docs/architecture/19-phase3-daily-work-cycle-architecture-report.md §2/§31.
@@ -48,11 +89,13 @@ export class ReportingService {
   private readonly permissions: PermissionService;
   private readonly tasks: TaskService;
   private readonly projects: ProjectService;
+  private readonly dailyWork: DailyWorkService;
 
   constructor(private readonly db: PrismaClient) {
     this.permissions = new PermissionService(db);
     this.tasks = new TaskService(db);
     this.projects = new ProjectService(db);
+    this.dailyWork = new DailyWorkService(db);
   }
 
   async getPersonalDashboard(actorId: string, workspaceId: string) {
@@ -124,18 +167,52 @@ export class ReportingService {
       where: { teamId },
       include: { user: { select: { id: true, fullName: true, email: true } } },
     });
-    const workload = members.map((m) => ({
-      user: m.user,
-      isHead: m.isHead,
-      activeTaskCount: teamTasks.filter(
-        (t) =>
-          t.assignments.some((a) => a.isCurrent && a.assigneeType === "USER" && a.assigneeUserId === m.userId) &&
-          t.status !== "COMPLETED" &&
-          t.status !== "CANCELLED"
-      ).length,
-    }));
 
-    return { team, teamTasks, unassigned, assigned, inProgress, overdue, pendingAcceptance: incoming, workload };
+    // doc 21 §6/§8: today's Daily Work Cycle signal per member (capacity, unplanned
+    // ratio, repeat carry-forward) — reused, not redefined, from DailyWorkService.
+    const signals = await this.dailyWork.getTeamSignals(members.map((m) => m.userId));
+    const signalByUserId = new Map(signals.map((s) => [s.userId, s]));
+
+    const workload = members.map((m) => {
+      const signal = signalByUserId.get(m.userId);
+      return {
+        user: m.user,
+        isHead: m.isHead,
+        activeTaskCount: teamTasks.filter(
+          (t) =>
+            t.assignments.some((a) => a.isCurrent && a.assigneeType === "USER" && a.assigneeUserId === m.userId) &&
+            t.status !== "COMPLETED" &&
+            t.status !== "CANCELLED"
+        ).length,
+        // doc 21 §6/§12 — extends the existing task-count-only workload figure with
+        // today's capacity/unplanned/carry-forward signal for the same person.
+        workdayStatus: signal?.workdayStatus ?? "NOT_STARTED",
+        capacityMinutes: signal?.capacityMinutes ?? 0,
+        plannedMinutes: signal?.plannedMinutes ?? 0,
+        overCapacity: signal?.overCapacity ?? false,
+        unplannedItemCount: signal?.unplannedItemCount ?? 0,
+        carryForwardRepeatCount: signal?.carryForwardRepeatCount ?? 0,
+      };
+    });
+
+    // doc 21 §6 — "stuck" acknowledgement: the team's current-assignment-pending tasks,
+    // filtered to those older than the threshold. Computed over teamTasks (already
+    // loaded above), not a new query.
+    const now = new Date();
+    const stuckAcknowledgement = teamTasks.filter((t) => isStuckAcknowledgement(t, now));
+
+    return {
+      team,
+      teamTasks,
+      unassigned,
+      assigned,
+      inProgress,
+      overdue,
+      pendingAcceptance: incoming,
+      workload,
+      stuckAcknowledgement,
+      attentionRequired: summarizeAttention(stuckAcknowledgement.length, signals),
+    };
   }
 
   async getOrganizationDashboard(actorId: string, organizationId: string) {
@@ -150,6 +227,8 @@ export class ReportingService {
     const pendingReview = allTasks.filter((t) => t.status === "SUBMITTED" || t.status === "UNDER_REVIEW");
     const completed = allTasks.filter((t) => t.status === "COMPLETED");
 
+    const now = new Date();
+
     const departments = await this.db.department.findMany({ where: { organizationId } });
     const departmentPerformance = departments.map((dept) => {
       const deptTasks = allTasks.filter((t) => t.originDepartmentId === dept.id);
@@ -158,6 +237,8 @@ export class ReportingService {
         totalTasks: deptTasks.length,
         completed: deptTasks.filter((t) => t.status === "COMPLETED").length,
         overdue: deptTasks.filter((t) => isOverdue(t.status, t.dueDate)).length,
+        // doc 21 §4/§6 — "which teams/departments have acknowledgement bottlenecks."
+        stuckAcknowledgementCount: deptTasks.filter((t) => isStuckAcknowledgement(t, now)).length,
       };
     });
 
@@ -171,8 +252,18 @@ export class ReportingService {
         totalTasks: teamTasks.length,
         completed: teamTasks.filter((t) => t.status === "COMPLETED").length,
         overdue: teamTasks.filter((t) => isOverdue(t.status, t.dueDate)).length,
+        stuckAcknowledgementCount: teamTasks.filter((t) => isStuckAcknowledgement(t, now)).length,
       };
     });
+
+    // doc 21 §4/§6/§18 — org-wide capacity/unplanned/carry-forward signal, one batched
+    // call across every active member (bounded by org headcount, not per-member N+1).
+    const activeMembers = await this.db.organizationMember.findMany({
+      where: { organizationId, status: "ACTIVE" },
+      select: { userId: true },
+    });
+    const orgSignals = await this.dailyWork.getTeamSignals(activeMembers.map((m) => m.userId));
+    const stuckAcknowledgementCount = allTasks.filter((t) => isStuckAcknowledgement(t, now)).length;
 
     return {
       totalTasks: allTasks.length,
@@ -182,6 +273,7 @@ export class ReportingService {
       completionTrend: { completedCount: completed.length, totalCount: allTasks.length },
       departmentPerformance,
       teamPerformance,
+      attentionRequired: summarizeAttention(stuckAcknowledgementCount, orgSignals),
     };
   }
 }

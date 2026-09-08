@@ -39,8 +39,11 @@ const DEFAULT_WORKING_WEEKDAYS = new Set(["mon", "tue", "wed", "thu", "fri"]);
 
 /** doc 19 §16 — advisory input to the capacity indicator only, never an enforcement
  * boundary. `workDate` is a plain UTC-midnight-anchored calendar date (matches @db.Date
- * semantics — see local-day.ts), so getUTCDay() correctly reads its calendar weekday. */
-function computeCapacityMinutes(workingHours: Prisma.JsonValue | null | undefined, workDate: Date): number {
+ * semantics — see local-day.ts), so getUTCDay() correctly reads its calendar weekday.
+ * Exported (doc 21 §6/§9): ReportingService's team-signal aggregation reuses this exact
+ * formula rather than redefining it — "capacity" must mean the same thing on the Today
+ * screen and in a manager's dashboard. */
+export function computeCapacityMinutes(workingHours: Prisma.JsonValue | null | undefined, workDate: Date): number {
   // getUTCDay() is always 0-6 and WEEKDAY_KEYS has exactly 7 entries — the non-null
   // assertion is safe by construction, not a suppressed real possibility of undefined.
   const weekday = WEEKDAY_KEYS[workDate.getUTCDay()]!;
@@ -547,4 +550,111 @@ export class DailyWorkService {
     const page = hasMore ? rows.slice(0, limit) : rows;
     return { items: page, nextCursor: hasMore ? (page[page.length - 1]?.id ?? null) : null };
   }
+
+  // ── Team signals (doc 21 §6/§8/§18 — read for ReportingService, never a new
+  // authorization surface of its own: the caller is responsible for the REPORTS_VIEW
+  // scope check before calling this, exactly as every other cross-service composition in
+  // this codebase already works, e.g. ReportingService -> TaskService.listTasks) ────────
+
+  /**
+   * Today's Daily Work Cycle signal for each of `userIds`, in each person's own local
+   * "today" (doc 21 §10 — never the caller's timezone, never server UTC). Never reads
+   * `Workday.reflectionNote` or any planning order/schedule field (doc 21 §8's explicit
+   * privacy boundary) — only work-state metadata. Two batched queries regardless of team
+   * size, not one query per member (doc 21 §18's explicit performance requirement).
+   */
+  async getTeamSignals(userIds: string[]): Promise<TeamMemberDailySignal[]> {
+    if (userIds.length === 0) return [];
+
+    const users = await this.db.user.findMany({
+      where: { id: { in: userIds } },
+      select: { id: true, defaultTimezone: true, workingHours: true },
+    });
+    const now = new Date();
+    const perUser = users.map((u) => ({ user: u, workDate: resolveLocalDate(now, u.defaultTimezone) }));
+
+    // One query for every relevant Workday row (each member's own local "today"), keyed
+    // by their unique (userId, workDate) — never a per-member round trip.
+    const workdays = perUser.length
+      ? await this.db.workday.findMany({
+          where: { OR: perUser.map(({ user, workDate }) => ({ userId: user.id, workDate })) },
+        })
+      : [];
+    const workdayByUserId = new Map(workdays.map((w) => [w.userId, w]));
+
+    // One query for every relevant DailyPlanItem, across every one of those Workdays.
+    const workdayIds = workdays.map((w) => w.id);
+    const items = workdayIds.length
+      ? await this.db.dailyPlanItem.findMany({
+          where: { workdayId: { in: workdayIds } },
+          select: {
+            id: true,
+            workdayId: true,
+            status: true,
+            isUnplanned: true,
+            plannedDurationMinutes: true,
+            carriedFromItemId: true,
+            task: { select: { estimatedDurationMinutes: true } },
+          },
+        })
+      : [];
+
+    // "Repeated" carry-forward (doc 21 §6) = a chain of length >= 2, detected via one more
+    // batched lookup of each item's own carry-forward parent — never an unbounded
+    // recursive walk (doc 21 §18's explicit reasoning for why this stays cheap).
+    const parentIds = [...new Set(items.map((i) => i.carriedFromItemId).filter((id): id is string => !!id))];
+    const parents = parentIds.length
+      ? await this.db.dailyPlanItem.findMany({ where: { id: { in: parentIds } }, select: { id: true, carriedFromItemId: true } })
+      : [];
+    const parentHasItsOwnParent = new Set(parents.filter((p) => p.carriedFromItemId).map((p) => p.id));
+
+    const itemsByWorkdayId = new Map<string, typeof items>();
+    for (const item of items) {
+      const arr = itemsByWorkdayId.get(item.workdayId) ?? [];
+      arr.push(item);
+      itemsByWorkdayId.set(item.workdayId, arr);
+    }
+
+    return perUser.map(({ user, workDate }) => {
+      const workday = workdayByUserId.get(user.id);
+      const myItems = workday ? (itemsByWorkdayId.get(workday.id) ?? []) : [];
+      const activeItems = myItems.filter((i) => i.status === "PLANNED" || i.status === "IN_PROGRESS");
+      const plannedMinutes = activeItems.reduce(
+        (sum, i) => sum + (i.plannedDurationMinutes ?? i.task.estimatedDurationMinutes ?? 0),
+        0
+      );
+      const capacityMinutes = computeCapacityMinutes(user.workingHours, workDate);
+      const carryForwardRepeatCount = myItems.filter(
+        (i) => i.carriedFromItemId && parentHasItsOwnParent.has(i.carriedFromItemId)
+      ).length;
+
+      return {
+        userId: user.id,
+        workdayStatus: (!workday ? "NOT_STARTED" : workday.closedAt ? "CLOSED" : "OPEN") as
+          | "NOT_STARTED"
+          | "OPEN"
+          | "CLOSED",
+        capacityMinutes,
+        plannedMinutes,
+        overCapacity: capacityMinutes > 0 && plannedMinutes > capacityMinutes,
+        totalItemCount: myItems.length,
+        unplannedItemCount: myItems.filter((i) => i.isUnplanned).length,
+        carryForwardRepeatCount,
+      };
+    });
+  }
+}
+
+/** doc 21 §6/§8 — coarse, aggregate work-state facts only; never reflectionNote, never
+ * planning order/schedule. Returned by DailyWorkService.getTeamSignals for
+ * ReportingService to compose into team/org dashboards. */
+export interface TeamMemberDailySignal {
+  userId: string;
+  workdayStatus: "NOT_STARTED" | "OPEN" | "CLOSED";
+  capacityMinutes: number;
+  plannedMinutes: number;
+  overCapacity: boolean;
+  totalItemCount: number;
+  unplannedItemCount: number;
+  carryForwardRepeatCount: number;
 }

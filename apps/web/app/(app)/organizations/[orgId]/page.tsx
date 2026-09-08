@@ -19,13 +19,34 @@ interface Role {
   isSystem: boolean;
   rolePermissions: Array<{ permission: { key: string } }>;
 }
+interface AttentionRequired {
+  stuckAcknowledgementCount: number;
+  overCapacityCount: number;
+  carryForwardRepeatCount: number;
+  unplannedCount: number;
+}
 interface OverviewData {
   totalTasks: number;
   overdue: unknown[];
   pendingReview: unknown[];
   completed: unknown[];
-  departmentPerformance: Array<{ department: { id: string; name: string }; totalTasks: number; completed: number; overdue: number }>;
-  teamPerformance: Array<{ team: { id: string; name: string }; totalTasks: number; completed: number; overdue: number }>;
+  departmentPerformance: Array<{
+    department: { id: string; name: string };
+    totalTasks: number;
+    completed: number;
+    overdue: number;
+    stuckAcknowledgementCount: number;
+  }>;
+  teamPerformance: Array<{
+    team: { id: string; name: string };
+    totalTasks: number;
+    completed: number;
+    overdue: number;
+    stuckAcknowledgementCount: number;
+  }>;
+  // Phase 4 — docs/architecture/21-phase4-management-visibility-architecture-report.md.
+  // A small, fixed set of org-wide totals — never a full BI breakdown (doc 21 §12/§22).
+  attentionRequired: AttentionRequired;
 }
 
 const TABS = ["Overview", "Departments", "Members", "Roles"] as const;
@@ -74,8 +95,31 @@ function OverviewTab({ orgId }: { orgId: string }) {
   if (error) return <p className="text-red-600">{error}</p>;
   if (!data) return <p className="text-slate-400">Loading…</p>;
 
+  const attention = data.attentionRequired;
+  const attentionTotal =
+    attention.stuckAcknowledgementCount + attention.overCapacityCount + attention.carryForwardRepeatCount + attention.unplannedCount;
+
   return (
     <div className="space-y-4">
+      {attentionTotal > 0 && (
+        <div className="card space-y-2 border-amber-200 bg-amber-50 p-4">
+          <h2 className="text-sm font-semibold text-amber-800">Attention required</h2>
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+            {[
+              { label: "Stuck in acknowledgement", value: attention.stuckAcknowledgementCount },
+              { label: "Over capacity today", value: attention.overCapacityCount },
+              { label: "Repeatedly carried forward", value: attention.carryForwardRepeatCount },
+              { label: "Unplanned items today", value: attention.unplannedCount },
+            ].map((s) => (
+              <div key={s.label}>
+                <p className="text-lg font-semibold text-amber-900">{s.value}</p>
+                <p className="text-xs text-amber-700">{s.label}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
         {[
           { label: "Total tasks", value: data.totalTasks },
@@ -102,7 +146,11 @@ function OverviewTab({ orgId }: { orgId: string }) {
   );
 }
 
-function PerformanceTable({ rows }: { rows: Array<{ name: string; totalTasks: number; completed: number; overdue: number }> }) {
+function PerformanceTable({
+  rows,
+}: {
+  rows: Array<{ name: string; totalTasks: number; completed: number; overdue: number; stuckAcknowledgementCount: number }>;
+}) {
   if (rows.length === 0) return <p className="text-sm text-slate-400">No data yet.</p>;
   return (
     <table className="w-full text-sm">
@@ -112,6 +160,7 @@ function PerformanceTable({ rows }: { rows: Array<{ name: string; totalTasks: nu
           <th className="py-1 font-medium">Total</th>
           <th className="py-1 font-medium">Completed</th>
           <th className="py-1 font-medium">Overdue</th>
+          <th className="py-1 font-medium">Stuck</th>
         </tr>
       </thead>
       <tbody>
@@ -121,6 +170,9 @@ function PerformanceTable({ rows }: { rows: Array<{ name: string; totalTasks: nu
             <td className="py-1.5 text-slate-600">{r.totalTasks}</td>
             <td className="py-1.5 text-slate-600">{r.completed}</td>
             <td className="py-1.5 text-slate-600">{r.overdue}</td>
+            <td className={`py-1.5 ${r.stuckAcknowledgementCount > 0 ? "font-medium text-amber-700" : "text-slate-600"}`}>
+              {r.stuckAcknowledgementCount}
+            </td>
           </tr>
         ))}
       </tbody>

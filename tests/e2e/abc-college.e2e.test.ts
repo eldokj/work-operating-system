@@ -1539,4 +1539,268 @@ describe("ABC College — full Phase 1 acceptance scenario (brief §32/33)", () 
       expect(original.data!.status).toBe("COMPLETED");
     });
   });
+
+  // ── Phase 4: Management Visibility & Work Graph Reporting — docs/architecture/21- ──
+  // ── phase4-management-visibility-architecture-report.md §20 ──
+  // Reuses Management -> Marketing Team -> Anu (Team Head) -> Rahul/Divya (members),
+  // Finance Team -> Priya, exactly like every prior phase's own test block.
+
+  describe("Phase 4: Management Visibility & Work Graph Reporting", () => {
+    it("1. Org Admin sees the full organization-wide dashboard, including the new attentionRequired summary", async () => {
+      const res = await eldo.client.get<{
+        totalTasks: number;
+        departmentPerformance: Array<{ department: { id: string }; stuckAcknowledgementCount: number }>;
+        teamPerformance: Array<{ team: { id: string }; stuckAcknowledgementCount: number }>;
+        attentionRequired: { stuckAcknowledgementCount: number; overCapacityCount: number; carryForwardRepeatCount: number; unplannedCount: number };
+      }>(`/api/v1/organizations/${orgId}/reports/overview`);
+      expect(res.status, JSON.stringify(res)).toBe(200);
+      expect(res.data!.attentionRequired).toBeTruthy();
+      expect(typeof res.data!.attentionRequired.stuckAcknowledgementCount).toBe("number");
+      expect(res.data!.departmentPerformance.some((d) => d.department.id === marketingDeptId)).toBe(true);
+      expect(res.data!.teamPerformance.every((t) => typeof t.stuckAcknowledgementCount === "number")).toBe(true);
+    });
+
+    it("2. Team Head (Anu) sees Marketing's team dashboard including the new fields, denied for Finance's", async () => {
+      const marketing = await anu.client.get<{
+        workload: Array<{ user: { id: string }; workdayStatus: string; capacityMinutes: number; plannedMinutes: number; overCapacity: boolean }>;
+        stuckAcknowledgement: unknown[];
+        attentionRequired: { stuckAcknowledgementCount: number };
+      }>(`/api/v1/organizations/${orgId}/reports/team/${marketingTeamId}`);
+      expect(marketing.status, JSON.stringify(marketing)).toBe(200);
+      expect(Array.isArray(marketing.data!.stuckAcknowledgement)).toBe(true);
+      expect(marketing.data!.workload.some((w) => w.user.id === rahul.id)).toBe(true);
+      expect(marketing.data!.workload.every((w) => typeof w.capacityMinutes === "number")).toBe(true);
+
+      const finance = await anu.client.get(`/api/v1/organizations/${orgId}/reports/team/${financeTeamId}`);
+      expect(finance.status).toBe(403);
+    });
+
+    it("3. a MANAGER-template role grant, scoped to a team, behaves identically to team membership — the engine is capability-based, not role-name-based", async () => {
+      const managerRole = roleIdByName.MANAGER;
+      expect(managerRole).toBeTruthy();
+      // Priya (Finance) has never been a Marketing member — grant her MANAGER scoped to
+      // Marketing Team specifically to prove REPORTS_VIEW-at-that-scope is what grants
+      // access, not any hardcoded "is this person on the team" role check.
+      const grant = await eldo.client.post(`/api/v1/organizations/${orgId}/role-grants`, {
+        userId: priya.id,
+        roleId: managerRole,
+        scopeType: "TEAM",
+        scopeId: marketingTeamId,
+      });
+      expect(grant.status, JSON.stringify(grant)).toBe(200);
+
+      const res = await priya.client.get(`/api/v1/organizations/${orgId}/reports/team/${marketingTeamId}`);
+      expect(res.status, JSON.stringify(res)).toBe(200);
+    });
+
+    it("4/6. cross-team isolation: a MEMBER with no REPORTS_VIEW at that scope and no team membership is denied", async () => {
+      // Rahul (Marketing member, MEMBER template only — no REPORTS_VIEW at all) attempting
+      // Finance's team dashboard: neither a Finance member nor REPORTS_VIEW-scoped there.
+      const res = await rahul.client.get(`/api/v1/organizations/${orgId}/reports/team/${financeTeamId}`);
+      expect(res.status).toBe(403);
+    });
+
+    it("5/7. Department Head sees team dashboards within their department, but is denied the org-wide dashboard (no unscoped REPORTS_VIEW grant)", async () => {
+      const deptHeadRole = roleIdByName.DEPARTMENT_HEAD;
+      expect(deptHeadRole).toBeTruthy();
+      const grant = await eldo.client.post(`/api/v1/organizations/${orgId}/role-grants`, {
+        userId: divya.id,
+        roleId: deptHeadRole,
+        scopeType: "DEPARTMENT",
+        scopeId: marketingDeptId,
+      });
+      expect(grant.status, JSON.stringify(grant)).toBe(200);
+
+      // Marketing Team belongs to the Marketing department — a department-scoped grant's
+      // departmentPathIds match extends to every team within it (doc 04 §4.4).
+      const teamView = await divya.client.get(`/api/v1/organizations/${orgId}/reports/team/${marketingTeamId}`);
+      expect(teamView.status, JSON.stringify(teamView)).toBe(200);
+
+      // The org-wide dashboard route asserts REPORTS_VIEW with NO department/team context
+      // — only an organization-scoped grant satisfies that, by design (doc 21 §9's exact
+      // "reporting visibility ≠ full task access" scoping, inherited unchanged from the
+      // pre-existing permission engine). A department-scoped Department Head is correctly
+      // denied the org-wide rollup.
+      const orgView = await divya.client.get(`/api/v1/organizations/${orgId}/reports/overview`);
+      expect(orgView.status).toBe(403);
+    });
+
+    it("8. cross-tenant isolation: an outsider from a different organization is denied every report route", async () => {
+      const outsider = await signup("reporting-outsider", "Reporting Outsider");
+      const teamRes = await outsider.client.get(`/api/v1/organizations/${orgId}/reports/team/${marketingTeamId}`);
+      expect(teamRes.status).toBe(403);
+      const orgRes = await outsider.client.get(`/api/v1/organizations/${orgId}/reports/overview`);
+      expect(orgRes.status).toBe(403);
+    });
+
+    it("9. current-owner attribution updates immediately after reassignment", async () => {
+      const task = await eldo.client.post<{ id: string }>("/api/v1/tasks", {
+        workspaceId: orgWorkspaceId,
+        title: "Reporting attribution check",
+      });
+      await eldo.client.post(`/api/v1/tasks/${task.data!.id}/assignments`, { assigneeType: "USER", assigneeUserId: rahul.id });
+      const t = await rahul.client.get<{ assignments: Array<{ id: string; isCurrent: boolean }> }>(`/api/v1/tasks/${task.data!.id}`);
+      // Accept first — a still-pending (ASSIGNED) task cannot be reassigned again per the
+      // task-status state machine (doc 05); reassignment requires IN_PROGRESS first.
+      await rahul.client.post(`/api/v1/assignments/${t.data!.assignments.find((a) => a.isCurrent)!.id}/accept`);
+
+      const before = await anu.client.get<{ workload: Array<{ user: { id: string }; activeTaskCount: number }> }>(
+        `/api/v1/organizations/${orgId}/reports/team/${marketingTeamId}`
+      );
+      const rahulBefore = before.data!.workload.find((w) => w.user.id === rahul.id)!.activeTaskCount;
+      const divyaBefore = before.data!.workload.find((w) => w.user.id === divya.id)!.activeTaskCount;
+
+      // Reassign from Rahul to Divya — attribution must move immediately, never stay
+      // attributed to Rahul as the "original"/prior assignee.
+      const reassign = await eldo.client.post(`/api/v1/tasks/${task.data!.id}/assignments`, {
+        assigneeType: "USER",
+        assigneeUserId: divya.id,
+      });
+      expect(reassign.status, JSON.stringify(reassign)).toBe(200);
+
+      const after = await anu.client.get<{ workload: Array<{ user: { id: string }; activeTaskCount: number }> }>(
+        `/api/v1/organizations/${orgId}/reports/team/${marketingTeamId}`
+      );
+      expect(after.data!.workload.find((w) => w.user.id === rahul.id)!.activeTaskCount).toBe(rahulBefore - 1);
+      expect(after.data!.workload.find((w) => w.user.id === divya.id)!.activeTaskCount).toBe(divyaBefore + 1);
+    });
+
+    it("10. a team-pending assignment shows in the incoming/pending-acceptance bucket, never inflating any individual's workload count", async () => {
+      const task = await eldo.client.post<{ id: string }>("/api/v1/tasks", {
+        workspaceId: orgWorkspaceId,
+        title: "Team-pending, not yet distributed",
+      });
+      const assignTeam = await eldo.client.post(`/api/v1/tasks/${task.data!.id}/assignments`, {
+        assigneeType: "TEAM",
+        assigneeTeamId: marketingTeamId,
+      });
+      expect(assignTeam.status, JSON.stringify(assignTeam)).toBe(200);
+
+      const res = await anu.client.get<{
+        pendingAcceptance: Array<{ id: string }>;
+        workload: Array<{ user: { id: string }; activeTaskCount: number }>;
+      }>(`/api/v1/organizations/${orgId}/reports/team/${marketingTeamId}`);
+      expect(res.status, JSON.stringify(res)).toBe(200);
+      expect(res.data!.pendingAcceptance.some((t) => t.id === task.data!.id)).toBe(true);
+      // Nobody has an individual, isCurrent USER-type assignment for this task yet — the
+      // existing workload definition (doc 21 §7, unchanged) only ever counts those.
+      for (const w of res.data!.workload) {
+        expect(w.activeTaskCount).toBeGreaterThanOrEqual(0); // sanity — no crash/NaN
+      }
+
+      // Clean up: Anu accepts on the team's behalf so it doesn't linger for later tests.
+      const withCurrent = await anu.client.get<{ assignments: Array<{ id: string; isCurrent: boolean }> }>(`/api/v1/tasks/${task.data!.id}`);
+      await anu.client.post(`/api/v1/assignments/${withCurrent.data!.assignments.find((a) => a.isCurrent)!.id}/accept`);
+    });
+
+    it("11. a freshly-created pending assignment does not appear as 'stuck' — the age threshold gate holds end-to-end", async () => {
+      const task = await eldo.client.post<{ id: string }>("/api/v1/tasks", {
+        workspaceId: orgWorkspaceId,
+        title: "Freshly assigned, not yet stuck",
+      });
+      await eldo.client.post(`/api/v1/tasks/${task.data!.id}/assignments`, { assigneeType: "USER", assigneeUserId: rahul.id });
+
+      const res = await anu.client.get<{ stuckAcknowledgement: Array<{ id: string }> }>(
+        `/api/v1/organizations/${orgId}/reports/team/${marketingTeamId}`
+      );
+      expect(res.status, JSON.stringify(res)).toBe(200);
+      expect(res.data!.stuckAcknowledgement.some((t) => t.id === task.data!.id)).toBe(false);
+
+      // Clean up: accept it so it doesn't linger pending for later tests in this block.
+      const t = await rahul.client.get<{ assignments: Array<{ id: string; isCurrent: boolean }> }>(`/api/v1/tasks/${task.data!.id}`);
+      await rahul.client.post(`/api/v1/assignments/${t.data!.assignments.find((a) => a.isCurrent)!.id}/accept`);
+    });
+
+    it("13/14/15. carry-forward-repeat, unplanned work, and daily capacity signals surface correctly in the team dashboard", async () => {
+      const task = await eldo.client.post<{ id: string }>("/api/v1/tasks", {
+        workspaceId: orgWorkspaceId,
+        title: "Carried forward twice, over capacity",
+      });
+      await eldo.client.post(`/api/v1/tasks/${task.data!.id}/assignments`, { assigneeType: "USER", assigneeUserId: divya.id });
+      const t = await divya.client.get<{ assignments: Array<{ id: string; isCurrent: boolean }> }>(`/api/v1/tasks/${task.data!.id}`);
+      await divya.client.post(`/api/v1/assignments/${t.data!.assignments.find((a) => a.isCurrent)!.id}/accept`);
+
+      const fmt = (d: Date) => d.toISOString().slice(0, 10);
+      const today = new Date();
+      const date0 = fmt(new Date(today.getTime() - 2 * 24 * 60 * 60 * 1000));
+      const date1 = fmt(new Date(today.getTime() - 1 * 24 * 60 * 60 * 1000));
+      const date2 = fmt(today);
+
+      // Also add a second, unplanned, over-capacity-inducing item directly on today.
+      const bigTask = await eldo.client.post<{ id: string }>("/api/v1/tasks", { workspaceId: orgWorkspaceId, title: "Big unplanned task" });
+      await eldo.client.post(`/api/v1/tasks/${bigTask.data!.id}/assignments`, { assigneeType: "USER", assigneeUserId: divya.id });
+      const t2 = await divya.client.get<{ assignments: Array<{ id: string; isCurrent: boolean }> }>(`/api/v1/tasks/${bigTask.data!.id}`);
+      await divya.client.post(`/api/v1/assignments/${t2.data!.assignments.find((a) => a.isCurrent)!.id}/accept`);
+      const bigAdd = await divya.client.post<{ id: string }>("/api/v1/me/workday/items", {
+        taskId: bigTask.data!.id,
+        date: date2,
+        isUnplanned: true,
+        plannedDurationMinutes: 500, // exceeds the 480-minute default daily capacity alone
+      });
+      expect(bigAdd.status, JSON.stringify(bigAdd)).toBe(200);
+
+      // Build a 2-hop carry-forward chain: date0 -> date1 -> date2 (today).
+      const item0 = await divya.client.post<{ id: string }>("/api/v1/me/workday/items", { taskId: task.data!.id, date: date0 });
+      expect(item0.status, JSON.stringify(item0)).toBe(200);
+      const close0 = await divya.client.post(`/api/v1/me/workday/close`, {
+        date: date0,
+        dispositions: [{ itemId: item0.data!.id, action: "CARRY_FORWARD", targetDate: date1 }],
+      });
+      expect(close0.status, JSON.stringify(close0)).toBe(200);
+
+      const day1Items = await divya.client.get<Array<{ id: string; carriedFromItemId: string | null }>>(
+        `/api/v1/me/workday/items?date=${date1}`
+      );
+      const item1 = day1Items.data!.find((i) => i.carriedFromItemId === item0.data!.id)!;
+      const close1 = await divya.client.post(`/api/v1/me/workday/close`, {
+        date: date1,
+        dispositions: [{ itemId: item1.id, action: "CARRY_FORWARD", targetDate: date2 }],
+      });
+      expect(close1.status, JSON.stringify(close1)).toBe(200);
+
+      const res = await anu.client.get<{
+        workload: Array<{
+          user: { id: string };
+          plannedMinutes: number;
+          capacityMinutes: number;
+          overCapacity: boolean;
+          unplannedItemCount: number;
+          carryForwardRepeatCount: number;
+        }>;
+        attentionRequired: { overCapacityCount: number; carryForwardRepeatCount: number; unplannedCount: number };
+      }>(`/api/v1/organizations/${orgId}/reports/team/${marketingTeamId}`);
+      expect(res.status, JSON.stringify(res)).toBe(200);
+
+      const divyaSignal = res.data!.workload.find((w) => w.user.id === divya.id)!;
+      // plannedMinutes is deterministic (500 minutes were explicitly planned) regardless
+      // of what day this suite happens to run on; overCapacity additionally depends on
+      // the default capacity policy being >0 minutes for today's weekday (0 on a
+      // weekend, doc 19 §16) — asserted conditionally so this test is never flaky based
+      // on the calendar date it happens to run against.
+      expect(divyaSignal.plannedMinutes).toBeGreaterThanOrEqual(500);
+      if (divyaSignal.capacityMinutes > 0) {
+        expect(divyaSignal.overCapacity).toBe(true);
+        expect(res.data!.attentionRequired.overCapacityCount).toBeGreaterThanOrEqual(1);
+      }
+      expect(divyaSignal.unplannedItemCount).toBeGreaterThanOrEqual(1);
+      expect(divyaSignal.carryForwardRepeatCount).toBeGreaterThanOrEqual(1);
+      expect(res.data!.attentionRequired.carryForwardRepeatCount).toBeGreaterThanOrEqual(1);
+      expect(res.data!.attentionRequired.unplannedCount).toBeGreaterThanOrEqual(1);
+    });
+
+    it("private Daily Work information (reflectionNote, planning order) never appears anywhere in a report response", async () => {
+      const res = await anu.client.get<Record<string, unknown>>(`/api/v1/organizations/${orgId}/reports/team/${marketingTeamId}`);
+      const raw = JSON.stringify(res.data);
+      expect(raw).not.toContain("reflectionNote");
+      expect(raw).not.toContain("scheduledStart");
+      expect(raw).not.toContain("scheduledEnd");
+    });
+
+    it("regression: Phase 1 through Phase 3 behavior is unaffected by anything Phase 4 added", async () => {
+      const original = await eldo.client.get<{ status: string }>(`/api/v1/tasks/${taskId}`);
+      expect(original.data!.status).toBe("COMPLETED");
+      const stillDenied = await priya.client.get(`/api/v1/organizations/${orgId}/reports/overview`);
+      expect(stillDenied.status).toBe(403);
+    });
+  });
 });

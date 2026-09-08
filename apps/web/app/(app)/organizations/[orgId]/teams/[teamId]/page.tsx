@@ -5,6 +5,26 @@ import { useParams } from "next/navigation";
 import { api, ApiError } from "@/lib/api-client";
 import { TaskCard, type TaskSummary } from "@/components/TaskCard";
 
+interface TeamWorkload {
+  user: { id: string; fullName: string };
+  isHead: boolean;
+  activeTaskCount: number;
+  // Phase 4 — docs/architecture/21-phase4-management-visibility-architecture-report.md
+  // §6/§8/§12: today's Daily Work Cycle signal for this person, reusing the exact same
+  // capacity formula and status shape the Today screen itself uses — never a redefinition.
+  workdayStatus: "NOT_STARTED" | "OPEN" | "CLOSED";
+  capacityMinutes: number;
+  plannedMinutes: number;
+  overCapacity: boolean;
+  unplannedItemCount: number;
+  carryForwardRepeatCount: number;
+}
+interface AttentionRequired {
+  stuckAcknowledgementCount: number;
+  overCapacityCount: number;
+  carryForwardRepeatCount: number;
+  unplannedCount: number;
+}
 interface TeamDashboard {
   team: { id: string; name: string };
   teamTasks: TaskSummary[];
@@ -13,7 +33,9 @@ interface TeamDashboard {
   inProgress: TaskSummary[];
   overdue: TaskSummary[];
   pendingAcceptance: TaskSummary[];
-  workload: Array<{ user: { id: string; fullName: string }; isHead: boolean; activeTaskCount: number }>;
+  workload: TeamWorkload[];
+  stuckAcknowledgement: TaskSummary[];
+  attentionRequired: AttentionRequired;
 }
 interface OrgMember {
   user: { id: string; fullName: string; email: string };
@@ -77,9 +99,32 @@ export default function TeamDetailPage() {
   if (error) return <p className="text-red-600">{error}</p>;
   if (!data) return <p className="text-slate-400">Loading…</p>;
 
+  const attention = data.attentionRequired;
+  const attentionTotal =
+    attention.stuckAcknowledgementCount + attention.overCapacityCount + attention.carryForwardRepeatCount + attention.unplannedCount;
+
   return (
     <div className="space-y-6">
       <h1 className="text-xl font-semibold text-slate-900">{data.team.name}</h1>
+
+      {attentionTotal > 0 && (
+        <div className="card space-y-2 border-amber-200 bg-amber-50 p-4">
+          <h2 className="text-sm font-semibold text-amber-800">Attention required</h2>
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+            {[
+              { label: "Stuck in acknowledgement", value: attention.stuckAcknowledgementCount },
+              { label: "Over capacity today", value: attention.overCapacityCount },
+              { label: "Repeatedly carried forward", value: attention.carryForwardRepeatCount },
+              { label: "Unplanned items today", value: attention.unplannedCount },
+            ].map((s) => (
+              <div key={s.label}>
+                <p className="text-lg font-semibold text-amber-900">{s.value}</p>
+                <p className="text-xs text-amber-700">{s.label}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-5">
         {[
@@ -96,17 +141,37 @@ export default function TeamDetailPage() {
         ))}
       </div>
 
+      {data.stuckAcknowledgement.length > 0 && (
+        <div className="card p-4">
+          <h2 className="mb-3 text-sm font-semibold text-slate-700">Stuck in acknowledgement</h2>
+          <div className="space-y-2">
+            {data.stuckAcknowledgement.map((t) => (
+              <TaskCard key={t.id} task={t} />
+            ))}
+          </div>
+        </div>
+      )}
+
       <div className="card p-4">
         <h2 className="mb-3 text-sm font-semibold text-slate-700">Members &amp; workload</h2>
         <div className="space-y-2">
           {data.workload.map((w) => (
-            <div key={w.user.id} className="flex items-center justify-between text-sm">
-              <div>
+            <div key={w.user.id} className="flex items-center justify-between gap-3 text-sm">
+              <div className="min-w-0">
                 <span className="font-medium text-slate-800">{w.user.fullName}</span>
                 {w.isHead && <span className="badge ml-2 bg-brand-50 text-brand-700">Team Head</span>}
                 <span className="ml-2 text-xs text-slate-400">{w.activeTaskCount} active task(s)</span>
+                {w.workdayStatus !== "NOT_STARTED" && (
+                  <span className="ml-2 text-xs text-slate-400">
+                    · {w.plannedMinutes}/{w.capacityMinutes} min today
+                    {w.overCapacity && <span className="ml-1 font-medium text-amber-700">over capacity</span>}
+                    {w.carryForwardRepeatCount > 0 && (
+                      <span className="ml-1 text-amber-700">· {w.carryForwardRepeatCount} repeated carry-forward</span>
+                    )}
+                  </span>
+                )}
               </div>
-              <label className="flex items-center gap-1 text-xs text-slate-500">
+              <label className="flex shrink-0 items-center gap-1 text-xs text-slate-500">
                 <input type="checkbox" checked={w.isHead} onChange={(e) => toggleHead(w.user.id, e.target.checked)} />
                 Head
               </label>

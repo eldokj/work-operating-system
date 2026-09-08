@@ -16,10 +16,12 @@ export async function register() {
 
   const tick = () => {
     runScheduledChecks(db, new Date())
-      .then(({ deadlineApproaching, overdue }) => {
+      .then(({ deadlineApproaching, overdue, meetingStartingSoon }) => {
         // doc §12 SHOULD HAVE — minimal observability, not a full logging/metrics stack.
-        if (deadlineApproaching > 0 || overdue > 0) {
-          console.log(`[scheduler] tick: deadlineApproaching=${deadlineApproaching} overdue=${overdue}`);
+        if (deadlineApproaching > 0 || overdue > 0 || meetingStartingSoon > 0) {
+          console.log(
+            `[scheduler] tick: deadlineApproaching=${deadlineApproaching} overdue=${overdue} meetingStartingSoon=${meetingStartingSoon}`
+          );
         }
       })
       .catch((err) => {

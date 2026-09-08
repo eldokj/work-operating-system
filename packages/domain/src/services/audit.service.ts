@@ -28,6 +28,12 @@ export interface AuditLogEntry {
    * indexed query over this same table, never a parallel one.
    */
   workdayId?: string | null;
+  /**
+   * Phase 7 addition (docs/architecture/26-phase7-calendar-meeting-architecture-report.md
+   * §16) — same pattern again, fifth use: a calendar event's full activity history
+   * becomes one indexed query over this same table, never a parallel one.
+   */
+  calendarEventId?: string | null;
 }
 
 /**
@@ -55,6 +61,7 @@ export class AuditService {
         taskId: entry.taskId ?? null,
         projectId: entry.projectId ?? null,
         workdayId: entry.workdayId ?? null,
+        calendarEventId: entry.calendarEventId ?? null,
       },
     });
   }
@@ -97,6 +104,23 @@ export class AuditService {
     const limit = opts.limit ?? 100;
     const rows = await this.db.auditLog.findMany({
       where: { workdayId },
+      orderBy: { createdAt: "asc" },
+      take: limit + 1,
+      ...(opts.cursor ? { cursor: { id: opts.cursor }, skip: 1 } : {}),
+      include: { actor: { select: { id: true, fullName: true, email: true } } },
+    });
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+    return { items: page, nextCursor: hasMore ? page[page.length - 1]?.id ?? null : null };
+  }
+
+  /** Same as listForTask/listForProject/listForWorkday, for a CalendarEvent — doc 26 §16.
+   * Read-only; the caller (CalendarService) is responsible for the view-access check
+   * (canViewEvent) before calling. */
+  async listForCalendarEvent(calendarEventId: string, opts: { limit?: number; cursor?: string } = {}) {
+    const limit = opts.limit ?? 100;
+    const rows = await this.db.auditLog.findMany({
+      where: { calendarEventId },
       orderBy: { createdAt: "asc" },
       take: limit + 1,
       ...(opts.cursor ? { cursor: { id: opts.cursor }, skip: 1 } : {}),

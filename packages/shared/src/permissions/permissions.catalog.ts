@@ -40,6 +40,13 @@ export const PERMISSIONS = {
   AUDIT_VIEW: "audit.view",
   AI_USE: "ai.use",
   AI_CONFIGURE: "ai.configure",
+  // Phase 7 — docs/architecture/26-phase7-calendar-meeting-architecture-report.md §13.
+  // Deliberately just one permission: creating/organizing your own event. Editing/
+  // cancelling/managing participants is ownership-based (organizer-only), not a separate
+  // permission grant — mirrors Workday's own "no 'act for someone else' capability" rule
+  // (doc 19 §27) rather than TaskAssignment's broader cross-scope permission set, since a
+  // calendar event has no assignment/routing concept to authorize.
+  CALENDAR_EVENT_CREATE: "calendar_event.create",
 } as const;
 
 export type PermissionKey = (typeof PERMISSIONS)[keyof typeof PERMISSIONS];
@@ -77,6 +84,7 @@ export const PERMISSION_CATALOG: Array<{ key: PermissionKey; description: string
   { key: PERMISSIONS.AUDIT_VIEW, description: "View audit log entries" },
   { key: PERMISSIONS.AI_USE, description: "Use any AI feature (Phase 2+)" },
   { key: PERMISSIONS.AI_CONFIGURE, description: "Toggle/configure AI features for an org (Phase 2+)" },
+  { key: PERMISSIONS.CALENDAR_EVENT_CREATE, description: "Create a calendar event (meeting/time commitment)" },
 ];
 
 // Seeded role templates — docs/architecture/04-rbac-permissions.md §4.3.
@@ -113,6 +121,7 @@ export const SYSTEM_ROLE_TEMPLATES: Record<string, PermissionKey[]> = {
     PERMISSIONS.REPORTS_VIEW,
     PERMISSIONS.AUDIT_VIEW,
     PERMISSIONS.AI_CONFIGURE,
+    PERMISSIONS.CALENDAR_EVENT_CREATE,
   ],
   DEPARTMENT_HEAD: [
     PERMISSIONS.DEPARTMENT_MANAGE,
@@ -135,6 +144,7 @@ export const SYSTEM_ROLE_TEMPLATES: Record<string, PermissionKey[]> = {
     PERMISSIONS.TASK_COMPLETE,
     PERMISSIONS.TASK_CANCEL,
     PERMISSIONS.REPORTS_VIEW,
+    PERMISSIONS.CALENDAR_EVENT_CREATE,
   ],
   TEAM_HEAD: [
     PERMISSIONS.TEAM_MANAGE_MEMBERS,
@@ -149,6 +159,7 @@ export const SYSTEM_ROLE_TEMPLATES: Record<string, PermissionKey[]> = {
     PERMISSIONS.TASK_REVIEW,
     PERMISSIONS.TASK_COMPLETE,
     PERMISSIONS.REPORTS_VIEW,
+    PERMISSIONS.CALENDAR_EVENT_CREATE,
   ],
   MANAGER: [
     PERMISSIONS.TASK_CREATE,
@@ -161,6 +172,7 @@ export const SYSTEM_ROLE_TEMPLATES: Record<string, PermissionKey[]> = {
     PERMISSIONS.TASK_COMMENT,
     PERMISSIONS.TASK_REVIEW,
     PERMISSIONS.REPORTS_VIEW,
+    PERMISSIONS.CALENDAR_EVENT_CREATE,
   ],
   MEMBER: [
     PERMISSIONS.TASK_CREATE,
@@ -168,6 +180,7 @@ export const SYSTEM_ROLE_TEMPLATES: Record<string, PermissionKey[]> = {
     PERMISSIONS.TASK_DECLINE,
     PERMISSIONS.TASK_UPDATE_PROGRESS,
     PERMISSIONS.TASK_COMMENT,
+    PERMISSIONS.CALENDAR_EVENT_CREATE,
   ],
 };
 
@@ -182,4 +195,5 @@ export const INDIVIDUAL_USER_PERMISSIONS: PermissionKey[] = [
   PERMISSIONS.WORKSPACE_CREATE,
   PERMISSIONS.PROJECT_CREATE,
   PERMISSIONS.PROJECT_MANAGE,
+  PERMISSIONS.CALENDAR_EVENT_CREATE,
 ];

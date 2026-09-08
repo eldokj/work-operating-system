@@ -23,11 +23,18 @@ export const DEADLINE_APPROACHING_WINDOW_MS = 24 * 60 * 60 * 1000;
 // and this module's own tests share one source of truth rather than two copies of "15".
 export const SCHEDULER_TICK_INTERVAL_MS = 15 * 60 * 1000;
 
+// doc 26 §15 — matches SCHEDULER_TICK_INTERVAL_MS exactly and deliberately: a lookahead
+// window equal to the tick interval is what guarantees every event is caught by exactly
+// one tick before it starts, with no gap and no double-catch, given a periodic 15-minute
+// tick (doc 26's own reasoning for this specific choice, not an arbitrary "15").
+export const MEETING_STARTING_SOON_WINDOW_MS = SCHEDULER_TICK_INTERVAL_MS;
+
 const NON_TERMINAL_TASK_STATUSES = ["DRAFT", "UNASSIGNED", "ASSIGNED", "IN_PROGRESS", "SUBMITTED", "UNDER_REVIEW", "CHANGES_REQUESTED"] as const;
 
 export interface SchedulerTickResult {
   deadlineApproaching: number;
   overdue: number;
+  meetingStartingSoon: number;
 }
 
 /**
@@ -38,11 +45,12 @@ export interface SchedulerTickResult {
  */
 export async function runScheduledChecks(db: PrismaClient, now: Date = new Date()): Promise<SchedulerTickResult> {
   const notifications = new NotificationService(db);
-  const [deadlineApproaching, overdue] = await Promise.all([
+  const [deadlineApproaching, overdue, meetingStartingSoon] = await Promise.all([
     tickDeadlineApproaching(db, notifications, now),
     tickOverdue(db, notifications, now),
+    tickMeetingStartingSoon(db, notifications, now),
   ]);
-  return { deadlineApproaching, overdue };
+  return { deadlineApproaching, overdue, meetingStartingSoon };
 }
 
 /**
@@ -125,6 +133,53 @@ async function tickOverdue(db: PrismaClient, notifications: NotificationService,
     if (claimed.count === 0) continue;
 
     await notifications.notify(assigneeId, NotificationType.TASK_OVERDUE, { taskId: task.id, taskTitle: task.title, dueDate: task.dueDate }, task.id);
+    sent++;
+  }
+  return sent;
+}
+
+/**
+ * doc 26 §15: a CONFIRMED calendar event is "starting soon" if its startAt falls within
+ * the lookahead window, and it has not already been notified. Recipients: the organizer
+ * plus every listed participant — the same "tell every party to the commitment" rule
+ * TASK_REASSIGNED already applies to a task's new assignee, generalized to a meeting's
+ * full participant set (doc 26 §3.1 — no per-participant RSVP state to filter on, so every
+ * participant is notified unconditionally). Same conditional-claim idempotency pattern as
+ * the two task-based checks above, applied to CalendarEvent's own marker column.
+ */
+async function tickMeetingStartingSoon(db: PrismaClient, notifications: NotificationService, now: Date): Promise<number> {
+  const startingBy = new Date(now.getTime() + MEETING_STARTING_SOON_WINDOW_MS);
+
+  const candidates = await db.calendarEvent.findMany({
+    where: {
+      startAt: { gt: now, lte: startingBy },
+      status: "CONFIRMED",
+      isAllDay: false,
+      startingSoonNotifiedAt: null,
+    },
+    select: {
+      id: true,
+      title: true,
+      startAt: true,
+      organizerId: true,
+      participants: { select: { userId: true } },
+    },
+  });
+
+  let sent = 0;
+  for (const event of candidates) {
+    const claimed = await db.calendarEvent.updateMany({
+      where: { id: event.id, startingSoonNotifiedAt: null },
+      data: { startingSoonNotifiedAt: now },
+    });
+    if (claimed.count === 0) continue; // a concurrent tick already claimed this event
+
+    const recipients = new Set<string>([event.organizerId, ...event.participants.map((p) => p.userId)]);
+    await notifications.notifyMany(
+      [...recipients],
+      NotificationType.MEETING_STARTING_SOON,
+      { eventId: event.id, eventTitle: event.title, startAt: event.startAt }
+    );
     sent++;
   }
   return sent;

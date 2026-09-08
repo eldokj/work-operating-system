@@ -104,6 +104,24 @@ enum ProjectKind {
   EVENT
 }
 
+// Phase 7 — docs/architecture/26-phase7-calendar-meeting-architecture-report.md §3/§12.
+// Deliberately not "DELETED" — events are cancelled, never hard-deleted, matching the same
+// convention Task already uses (doc 05).
+enum CalendarEventStatus {
+  CONFIRMED
+  CANCELLED
+}
+
+// doc 26 §13 — the load-bearing authorization decision. PRIVATE is the default (opt-in
+// exposure, never opt-out): visible in full only to the organizer and listed participants.
+// ORGANIZATION_VISIBLE is an explicit choice by the organizer to expose full detail to any
+// member of the event's own organization — REPORTS_VIEW/reporting scope never grants this
+// on its own (doc 26 §13's central rule).
+enum CalendarEventVisibility {
+  PRIVATE
+  ORGANIZATION_VISIBLE
+}
+
 enum DependencyType {
   BLOCKS
   RELATES_TO
@@ -134,50 +152,53 @@ enum ScopeType {
 // ─────────────────────────────────────────────────────────────────────────
 
 model User {
-  id               String   @id @default(uuid())
-  email            String   @unique
-  fullName         String   @map("full_name")
-  avatarUrl        String?  @map("avatar_url")
-  defaultTimezone  String   @default("UTC") @map("default_timezone")
-  passwordHash     String   @map("password_hash") // Phase 1 local auth only — see doc 14
+  id              String   @id @default(uuid())
+  email           String   @unique
+  fullName        String   @map("full_name")
+  avatarUrl       String?  @map("avatar_url")
+  defaultTimezone String   @default("UTC") @map("default_timezone")
+  passwordHash    String   @map("password_hash") // Phase 1 local auth only — see doc 14
   // Phase 3 — docs/architecture/19-phase3-daily-work-cycle-architecture-report.md §12/§16.
   // Optional per-weekday {start,end} in "HH:mm"; null means "use the system default
   // (Mon-Fri 09:00-17:00)" applied in application code. Advisory input to capacity math
   // only — never an enforcement boundary on when a user may act (doc 19 §16/§22).
-  workingHours     Json?    @map("working_hours")
-  createdAt        DateTime @default(now()) @map("created_at")
+  workingHours    Json?    @map("working_hours")
+  createdAt       DateTime @default(now()) @map("created_at")
 
-  organizationMemberships OrganizationMember[]
-  createdOrganizations    Organization[]        @relation("OrgCreatedBy")
-  createdDepartments      Department[]          @relation("DeptCreatedBy")
-  createdTeams            Team[]                @relation("TeamCreatedBy")
-  teamMemberships         TeamMember[]
-  userRoles               UserRole[]            @relation("UserRoleHolder")
-  grantedRoles            UserRole[]            @relation("UserRoleGrantedBy")
-  ownedWorkspaces         Workspace[]
-  ownedProjects           Project[]
-  createdTasks            Task[]                @relation("TaskCreatedBy")
-  assignmentsMade         TaskAssignment[]      @relation("AssignmentAssignedBy")
-  assignmentsReceived     TaskAssignment[]      @relation("AssignmentAssigneeUser")
-  assignmentsRespondedTo  TaskAssignment[]      @relation("AssignmentRespondedBy")
-  checklistItemsCreated   TaskChecklistItem[]
-  comments                TaskComment[]
-  updates                 TaskUpdate[]
-  attachmentsUploaded     TaskAttachment[]
-  reviews                 TaskReview[]
-  notifications           Notification[]
-  auditLogsAsActor        AuditLog[]
-  originAssignedTasks     Task[]                @relation("TaskOriginAssignor")
-  aiInteractions          AiInteraction[]
-  sentMessages            TaskMessage[]
-  messageMentions         TaskMessageMention[]
-  messageReactions        TaskMessageReaction[]
-  conversationReads       TaskConversationRead[]
-  projectMemberships      ProjectMember[]         @relation("ProjectMemberUser")
-  projectMembersAdded     ProjectMember[]         @relation("ProjectMemberAddedBy")
-  projectTeamsAdded       ProjectTeam[]
-  projectDatesCreated     ProjectDate[]
-  workdays                Workday[]
+  organizationMemberships     OrganizationMember[]
+  createdOrganizations        Organization[]             @relation("OrgCreatedBy")
+  createdDepartments          Department[]               @relation("DeptCreatedBy")
+  createdTeams                Team[]                     @relation("TeamCreatedBy")
+  teamMemberships             TeamMember[]
+  userRoles                   UserRole[]                 @relation("UserRoleHolder")
+  grantedRoles                UserRole[]                 @relation("UserRoleGrantedBy")
+  ownedWorkspaces             Workspace[]
+  ownedProjects               Project[]
+  createdTasks                Task[]                     @relation("TaskCreatedBy")
+  assignmentsMade             TaskAssignment[]           @relation("AssignmentAssignedBy")
+  assignmentsReceived         TaskAssignment[]           @relation("AssignmentAssigneeUser")
+  assignmentsRespondedTo      TaskAssignment[]           @relation("AssignmentRespondedBy")
+  checklistItemsCreated       TaskChecklistItem[]
+  comments                    TaskComment[]
+  updates                     TaskUpdate[]
+  attachmentsUploaded         TaskAttachment[]
+  reviews                     TaskReview[]
+  notifications               Notification[]
+  auditLogsAsActor            AuditLog[]
+  originAssignedTasks         Task[]                     @relation("TaskOriginAssignor")
+  aiInteractions              AiInteraction[]
+  sentMessages                TaskMessage[]
+  messageMentions             TaskMessageMention[]
+  messageReactions            TaskMessageReaction[]
+  conversationReads           TaskConversationRead[]
+  projectMemberships          ProjectMember[]            @relation("ProjectMemberUser")
+  // Phase 7 — docs/architecture/26-phase7-calendar-meeting-architecture-report.md.
+  organizedCalendarEvents     CalendarEvent[]            @relation("CalendarEventOrganizer")
+  calendarEventParticipations CalendarEventParticipant[]
+  projectMembersAdded         ProjectMember[]            @relation("ProjectMemberAddedBy")
+  projectTeamsAdded           ProjectTeam[]
+  projectDatesCreated         ProjectDate[]
+  workdays                    Workday[]
 
   @@map("users")
 }
@@ -190,17 +211,17 @@ model Organization {
   createdById String   @map("created_by")
   createdAt   DateTime @default(now()) @map("created_at")
 
-  createdBy   User                  @relation("OrgCreatedBy", fields: [createdById], references: [id])
-  members     OrganizationMember[]
-  departments Department[]
-  teams       Team[]
-  roles       Role[]
-  userRoles   UserRole[]
-  workspaces  Workspace[]
-  tags        Tag[]
-  auditLogs   AuditLog[]
+  createdBy      User                 @relation("OrgCreatedBy", fields: [createdById], references: [id])
+  members        OrganizationMember[]
+  departments    Department[]
+  teams          Team[]
+  roles          Role[]
+  userRoles      UserRole[]
+  workspaces     Workspace[]
+  tags           Tag[]
+  auditLogs      AuditLog[]
   aiInteractions AiInteraction[]
-  originTasks Task[]          @relation("TaskOriginOrganization")
+  originTasks    Task[]               @relation("TaskOriginOrganization")
 
   @@map("organizations")
 }
@@ -226,12 +247,12 @@ model OrganizationMember {
 // ─────────────────────────────────────────────────────────────────────────
 
 model Department {
-  id                   String   @id @default(uuid())
-  organizationId       String   @map("organization_id")
-  parentDepartmentId   String?  @map("parent_department_id")
-  name                 String
-  createdById          String   @map("created_by")
-  createdAt            DateTime @default(now()) @map("created_at")
+  id                 String   @id @default(uuid())
+  organizationId     String   @map("organization_id")
+  parentDepartmentId String?  @map("parent_department_id")
+  name               String
+  createdById        String   @map("created_by")
+  createdAt          DateTime @default(now()) @map("created_at")
 
   organization     Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   parentDepartment Department?  @relation("DeptHierarchy", fields: [parentDepartmentId], references: [id])
@@ -253,13 +274,13 @@ model Team {
   createdById    String   @map("created_by")
   createdAt      DateTime @default(now()) @map("created_at")
 
-  organization        Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  department           Department?      @relation(fields: [departmentId], references: [id])
-  createdBy            User             @relation("TeamCreatedBy", fields: [createdById], references: [id])
-  members              TeamMember[]
-  projects             Project[]
+  organization          Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  department            Department?      @relation(fields: [departmentId], references: [id])
+  createdBy             User             @relation("TeamCreatedBy", fields: [createdById], references: [id])
+  members               TeamMember[]
+  projects              Project[]
   assignmentsAsAssignee TaskAssignment[] @relation("AssignmentAssigneeTeam")
-  originTasks          Task[]           @relation("TaskOriginTeam")
+  originTasks           Task[]           @relation("TaskOriginTeam")
   projectTeams          ProjectTeam[]
 
   @@index([organizationId])
@@ -358,16 +379,17 @@ model Workspace {
   // Cascade (not the Prisma default of nulling the FK) — a personal workspace's
   // owner_user_id must always satisfy the workspaces_owner_xor_org_check constraint, so
   // deleting the owning user has to delete their personal workspace, never null it out.
-  owner        User?        @relation(fields: [ownerUserId], references: [id], onDelete: Cascade)
+  owner          User?           @relation(fields: [ownerUserId], references: [id], onDelete: Cascade)
   // Same reasoning as `owner` above, for the organization-workspace side of the check.
-  organization Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  projects     Project[]
-  tasks        Task[]
+  organization   Organization?   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  projects       Project[]
+  tasks          Task[]
+  calendarEvents CalendarEvent[]
+  // CHECK (exactly one of owner_user_id / organization_id set) added via raw-SQL migration
 
   @@index([ownerUserId])
   @@index([organizationId])
   @@map("workspaces")
-  // CHECK (exactly one of owner_user_id / organization_id set) added via raw-SQL migration
 }
 
 // Phase 1 model, minimally wired until Phase 2C — docs/architecture/17-phase2c-
@@ -390,17 +412,20 @@ model Project {
   targetDate   DateTime?     @map("target_date") @db.Date
   createdAt    DateTime      @default(now()) @map("created_at")
 
-  workspace    Workspace         @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
-  department   Department?       @relation(fields: [departmentId], references: [id])
-  team         Team?             @relation(fields: [teamId], references: [id])
-  owner        User              @relation(fields: [ownerId], references: [id])
-  tasks        Task[]
-  members      ProjectMember[]
-  teams        ProjectTeam[]
-  dates        ProjectDate[]
-  conversation Conversation?
-  attachments  TaskAttachment[]
-  auditLogs    AuditLog[]        @relation("AuditLogProject")
+  workspace      Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  department     Department?      @relation(fields: [departmentId], references: [id])
+  team           Team?            @relation(fields: [teamId], references: [id])
+  owner          User             @relation(fields: [ownerId], references: [id])
+  tasks          Task[]
+  members        ProjectMember[]
+  teams          ProjectTeam[]
+  dates          ProjectDate[]
+  conversation   Conversation?
+  attachments    TaskAttachment[]
+  auditLogs      AuditLog[]       @relation("AuditLogProject")
+  // Phase 7 — docs/architecture/26-phase7-calendar-meeting-architecture-report.md §5.
+  // Optional context link only — a Project never structurally requires/contains events.
+  calendarEvents CalendarEvent[]
 
   @@index([workspaceId])
   @@map("projects")
@@ -411,11 +436,11 @@ model Project {
 // never for task-level accountability, which TaskAssignment alone continues to own
 // unconditionally.
 model ProjectMember {
-  id          String   @id @default(uuid())
-  projectId   String   @map("project_id")
-  userId      String   @map("user_id")
-  addedById   String   @map("added_by")
-  createdAt   DateTime @default(now()) @map("created_at")
+  id        String   @id @default(uuid())
+  projectId String   @map("project_id")
+  userId    String   @map("user_id")
+  addedById String   @map("added_by")
+  createdAt DateTime @default(now()) @map("created_at")
 
   project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
   user    User    @relation("ProjectMemberUser", fields: [userId], references: [id], onDelete: Cascade)
@@ -452,13 +477,13 @@ model ProjectTeam {
 // linked to any Task.dueDate (a project milestone like "Guest Confirmation" isn't
 // necessarily one task's deadline).
 model ProjectDate {
-  id          String    @id @default(uuid())
-  projectId   String    @map("project_id")
+  id          String   @id @default(uuid())
+  projectId   String   @map("project_id")
   title       String
-  date        DateTime  @db.Date
+  date        DateTime @db.Date
   notes       String?
-  createdById String    @map("created_by")
-  createdAt   DateTime  @default(now()) @map("created_at")
+  createdById String   @map("created_by")
+  createdAt   DateTime @default(now()) @map("created_at")
 
   project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
   createdBy User    @relation(fields: [createdById], references: [id])
@@ -467,22 +492,89 @@ model ProjectDate {
   @@map("project_dates")
 }
 
+// Phase 7 — docs/architecture/26-phase7-calendar-meeting-architecture-report.md §5/§12.
+// A meeting/time commitment — NOT the same concept as a Project with kind=EVENT (a
+// multi-day, multi-task unit of organized work) and NOT an extension of ProjectDate above
+// (a date-only milestone marker with no time-of-day/attendees/duration). `projectId` is an
+// optional context link only — a Project never structurally requires or contains events.
+// Task time-blocking deliberately reuses DailyPlanItem.scheduledStart/scheduledEnd instead
+// of a parallel entity here (doc 26 §6) — this model exists solely for non-task
+// commitments (meetings) that have no task-shaped representation.
+model CalendarEvent {
+  id                     String                  @id @default(uuid())
+  workspaceId            String                  @map("workspace_id")
+  organizerId            String                  @map("organizer_id")
+  projectId              String?                 @map("project_id")
+  title                  String
+  description            String?
+  // Instants, not @db.Date — unlike ProjectDate, an event's whole reason for existing is
+  // its time component (doc 26 §14). All-day events are still stored as instants (local-
+  // day midnight-to-midnight in the organizer's own timezone at creation time); isAllDay
+  // only changes how they're rendered.
+  startAt                DateTime                @map("start_at")
+  endAt                  DateTime                @map("end_at")
+  isAllDay               Boolean                 @default(false) @map("is_all_day")
+  location               String?
+  meetingLink            String?                 @map("meeting_link")
+  status                 CalendarEventStatus     @default(CONFIRMED)
+  visibility             CalendarEventVisibility @default(PRIVATE)
+  // Reserved, unused extension points for a future external-sync phase (doc 26 §11) — the
+  // same "named extension point, not wired up" pattern as DeliveryChannel.PUSH/.EMAIL.
+  // Never set by any code in this phase.
+  externalProvider       String?                 @map("external_provider")
+  externalEventId        String?                 @map("external_event_id")
+  // Idempotency marker for the scheduler's "meeting starting soon" check, exactly
+  // mirroring Task.deadlineApproachingNotifiedAt's conditional-claim pattern (doc 24 §8,
+  // reused here per doc 26 §15).
+  startingSoonNotifiedAt DateTime?               @map("starting_soon_notified_at")
+  createdAt              DateTime                @default(now()) @map("created_at")
+  updatedAt              DateTime                @updatedAt @map("updated_at")
+
+  workspace    Workspace                  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  organizer    User                       @relation("CalendarEventOrganizer", fields: [organizerId], references: [id])
+  project      Project?                   @relation(fields: [projectId], references: [id])
+  participants CalendarEventParticipant[]
+  auditLogs    AuditLog[]
+
+  // Every day/week range query filters by workspace + start (doc 26 §21); "my organized
+  // events" is the other common access pattern.
+  @@index([workspaceId, startAt])
+  @@index([organizerId, startAt])
+  @@map("calendar_events")
+}
+
+// Deliberately minimal — a flat participant list, no per-participant RSVP/response state
+// in v1 (doc 26 §3.1). Answers "who does this occupy time for" and "who can see this,"
+// which is all this phase's stated objective needs.
+model CalendarEventParticipant {
+  id      String @id @default(uuid())
+  eventId String @map("event_id")
+  userId  String @map("user_id")
+
+  event CalendarEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  user  User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([eventId, userId])
+  @@index([userId])
+  @@map("calendar_event_participants")
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Tasks & the assignment chain (doc 05, doc 06) — the core of the system
 // ─────────────────────────────────────────────────────────────────────────
 
 model Task {
-  id                        String         @id @default(uuid())
-  workspaceId               String         @map("workspace_id")
-  projectId                 String?        @map("project_id")
-  parentTaskId              String?        @map("parent_task_id")
-  title                     String
-  description               String?
-  priority                  TaskPriority   @default(MEDIUM)
-  status                    TaskStatus     @default(UNASSIGNED)
-  startDate                 DateTime?      @map("start_date") @db.Date
-  dueDate                   DateTime?      @map("due_date")
-  estimatedDurationMinutes  Int?           @map("estimated_duration_minutes")
+  id                       String       @id @default(uuid())
+  workspaceId              String       @map("workspace_id")
+  projectId                String?      @map("project_id")
+  parentTaskId             String?      @map("parent_task_id")
+  title                    String
+  description              String?
+  priority                 TaskPriority @default(MEDIUM)
+  status                   TaskStatus   @default(UNASSIGNED)
+  startDate                DateTime?    @map("start_date") @db.Date
+  dueDate                  DateTime?    @map("due_date")
+  estimatedDurationMinutes Int?         @map("estimated_duration_minutes")
 
   // Phase 6 — docs/architecture/24-phase6-notifications-scheduler-architecture-report.md
   // §8/§14. Idempotency markers for the scheduler's two deadline-based checks: NULL means
@@ -492,10 +584,10 @@ model Task {
   // Never cleared/reset once set — a task moving out of the approaching/overdue window
   // (e.g. dueDate pushed out, or task completed) simply stops matching the tick's query;
   // the marker itself is permanent history, not a live flag.
-  deadlineApproachingNotifiedAt DateTime? @map("deadline_approaching_notified_at")
-  overdueNotifiedAt             DateTime? @map("overdue_notified_at")
-  createdById               String         @map("created_by")
-  createdVia                TaskCreatedVia @default(DIRECT) @map("created_via")
+  deadlineApproachingNotifiedAt DateTime?      @map("deadline_approaching_notified_at")
+  overdueNotifiedAt             DateTime?      @map("overdue_notified_at")
+  createdById                   String         @map("created_by")
+  createdVia                    TaskCreatedVia @default(DIRECT) @map("created_via")
 
   // Origin fields — set once (at creation / first assignment) and NEVER overwritten by
   // later reassignment. Required by doc 13 #9/#12 and the cross-department test scenario.
@@ -507,35 +599,35 @@ model Task {
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
 
-  workspace         Workspace           @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
-  project           Project?            @relation(fields: [projectId], references: [id])
-  parentTask        Task?               @relation("TaskSubtasks", fields: [parentTaskId], references: [id])
-  subtasks          Task[]              @relation("TaskSubtasks")
-  createdBy         User                @relation("TaskCreatedBy", fields: [createdById], references: [id])
-  originOrganization Organization?      @relation("TaskOriginOrganization", fields: [originOrganizationId], references: [id])
-  originDepartment  Department?         @relation("TaskOriginDepartment", fields: [originDepartmentId], references: [id])
-  originTeam        Team?               @relation("TaskOriginTeam", fields: [originTeamId], references: [id])
-  originAssignor    User?               @relation("TaskOriginAssignor", fields: [originAssignorId], references: [id])
+  workspace          Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  project            Project?      @relation(fields: [projectId], references: [id])
+  parentTask         Task?         @relation("TaskSubtasks", fields: [parentTaskId], references: [id])
+  subtasks           Task[]        @relation("TaskSubtasks")
+  createdBy          User          @relation("TaskCreatedBy", fields: [createdById], references: [id])
+  originOrganization Organization? @relation("TaskOriginOrganization", fields: [originOrganizationId], references: [id])
+  originDepartment   Department?   @relation("TaskOriginDepartment", fields: [originDepartmentId], references: [id])
+  originTeam         Team?         @relation("TaskOriginTeam", fields: [originTeamId], references: [id])
+  originAssignor     User?         @relation("TaskOriginAssignor", fields: [originAssignorId], references: [id])
 
-  assignments       TaskAssignment[]
-  checklistItems    TaskChecklistItem[]
-  comments          TaskComment[]
-  updates           TaskUpdate[]
-  attachments       TaskAttachment[]
-  dependencies      TaskDependency[]    @relation("DependentTask")
-  dependedOnBy      TaskDependency[]    @relation("DependsOnTask")
-  reviews           TaskReview[]
-  tags              TaskTag[]
-  notifications     Notification[]
+  assignments    TaskAssignment[]
+  checklistItems TaskChecklistItem[]
+  comments       TaskComment[]
+  updates        TaskUpdate[]
+  attachments    TaskAttachment[]
+  dependencies   TaskDependency[]    @relation("DependentTask")
+  dependedOnBy   TaskDependency[]    @relation("DependsOnTask")
+  reviews        TaskReview[]
+  tags           TaskTag[]
+  notifications  Notification[]
   // Phase 2A — docs/architecture/15-task-conversation.md. Exactly one per task, enforced
   // by the unique constraint on Conversation.taskId (widened for Phase 2C — doc 17 §6.4).
-  conversation      Conversation?
-  auditLogs         AuditLog[]          @relation("AuditLogTask")
+  conversation   Conversation?
+  auditLogs      AuditLog[]          @relation("AuditLogTask")
   // Phase 3 — docs/architecture/19-phase3-daily-work-cycle-architecture-report.md §13.
   // A task may appear on any number of daily plan entries across different days (never
   // more than one per single day — enforced by DailyPlanItem's own unique constraint) —
   // this Task row is always the source of truth; DailyPlanItem only ever references it.
-  dailyPlanItems    DailyPlanItem[]
+  dailyPlanItems DailyPlanItem[]
 
   @@index([workspaceId])
   @@index([projectId])
@@ -550,29 +642,29 @@ model Task {
 
 // The routing/acknowledgement chain (doc 06). One row per "hop."
 model TaskAssignment {
-  id                  String           @id @default(uuid())
-  taskId              String           @map("task_id")
-  assigneeType        AssigneeType     @map("assignee_type")
-  assigneeUserId      String?          @map("assignee_user_id") // set iff assigneeType=USER
-  assigneeTeamId      String?          @map("assignee_team_id") // set iff assigneeType=TEAM
-  assignedById        String           @map("assigned_by")
-  parentAssignmentId  String?          @map("parent_assignment_id")
-  status              AssignmentStatus @default(PENDING_ACKNOWLEDGEMENT)
-  respondedById       String?          @map("responded_by")
-  respondedAt         DateTime?        @map("responded_at")
-  declineReason       String?          @map("decline_reason")
-  isCurrent           Boolean          @default(true) @map("is_current")
-  createdAt           DateTime         @default(now()) @map("created_at")
+  id                 String           @id @default(uuid())
+  taskId             String           @map("task_id")
+  assigneeType       AssigneeType     @map("assignee_type")
+  assigneeUserId     String?          @map("assignee_user_id") // set iff assigneeType=USER
+  assigneeTeamId     String?          @map("assignee_team_id") // set iff assigneeType=TEAM
+  assignedById       String           @map("assigned_by")
+  parentAssignmentId String?          @map("parent_assignment_id")
+  status             AssignmentStatus @default(PENDING_ACKNOWLEDGEMENT)
+  respondedById      String?          @map("responded_by")
+  respondedAt        DateTime?        @map("responded_at")
+  declineReason      String?          @map("decline_reason")
+  isCurrent          Boolean          @default(true) @map("is_current")
+  createdAt          DateTime         @default(now()) @map("created_at")
 
-  task              Task             @relation(fields: [taskId], references: [id], onDelete: Cascade)
-  assigneeUser      User?            @relation("AssignmentAssigneeUser", fields: [assigneeUserId], references: [id])
-  assigneeTeam      Team?            @relation("AssignmentAssigneeTeam", fields: [assigneeTeamId], references: [id])
-  assignedBy        User             @relation("AssignmentAssignedBy", fields: [assignedById], references: [id])
-  respondedBy       User?            @relation("AssignmentRespondedBy", fields: [respondedById], references: [id])
-  parentAssignment  TaskAssignment?  @relation("AssignmentChain", fields: [parentAssignmentId], references: [id])
-  childAssignments  TaskAssignment[] @relation("AssignmentChain")
-  updates           TaskUpdate[]
-  reviews           TaskReview[]
+  task             Task             @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  assigneeUser     User?            @relation("AssignmentAssigneeUser", fields: [assigneeUserId], references: [id])
+  assigneeTeam     Team?            @relation("AssignmentAssigneeTeam", fields: [assigneeTeamId], references: [id])
+  assignedBy       User             @relation("AssignmentAssignedBy", fields: [assignedById], references: [id])
+  respondedBy      User?            @relation("AssignmentRespondedBy", fields: [respondedById], references: [id])
+  parentAssignment TaskAssignment?  @relation("AssignmentChain", fields: [parentAssignmentId], references: [id])
+  childAssignments TaskAssignment[] @relation("AssignmentChain")
+  updates          TaskUpdate[]
+  reviews          TaskReview[]
 
   @@index([taskId])
   @@index([assigneeUserId])
@@ -614,14 +706,14 @@ model TaskComment {
 }
 
 model TaskUpdate {
-  id            String     @id @default(uuid())
-  taskId        String     @map("task_id")
-  assignmentId  String?    @map("assignment_id")
-  userId        String     @map("user_id")
-  percentage    Int?
+  id             String      @id @default(uuid())
+  taskId         String      @map("task_id")
+  assignmentId   String?     @map("assignment_id")
+  userId         String      @map("user_id")
+  percentage     Int?
   statusSnapshot TaskStatus? @map("status_snapshot")
-  note          String?
-  createdAt     DateTime   @default(now()) @map("created_at")
+  note           String?
+  createdAt      DateTime    @default(now()) @map("created_at")
 
   task       Task            @relation(fields: [taskId], references: [id], onDelete: Cascade)
   assignment TaskAssignment? @relation(fields: [assignmentId], references: [id])
@@ -676,7 +768,7 @@ model TaskDependency {
   dependsOnTaskId String         @map("depends_on_task_id")
   type            DependencyType @default(BLOCKS)
 
-  task        Task @relation("DependentTask", fields: [taskId], references: [id], onDelete: Cascade)
+  task          Task @relation("DependentTask", fields: [taskId], references: [id], onDelete: Cascade)
   dependsOnTask Task @relation("DependsOnTask", fields: [dependsOnTaskId], references: [id], onDelete: Cascade)
 
   @@unique([taskId, dependsOnTaskId])
@@ -747,17 +839,17 @@ model Notification {
 // Append-only. DB-level immutability (REVOKE UPDATE/DELETE from app role) is applied via
 // a raw-SQL migration — see doc 12 §12.7.
 model AuditLog {
-  id             String       @id @default(uuid())
-  organizationId String?      @map("organization_id")
-  actorId        String       @map("actor_id")
+  id             String      @id @default(uuid())
+  organizationId String?     @map("organization_id")
+  actorId        String      @map("actor_id")
   action         String
-  entityType     String       @map("entity_type")
-  entityId       String       @map("entity_id")
+  entityType     String      @map("entity_type")
+  entityId       String      @map("entity_id")
   before         Json?
   after          Json?
   reason         String?
-  source         AuditSource  @default(UI)
-  createdAt      DateTime     @default(now()) @map("created_at")
+  source         AuditSource @default(UI)
+  createdAt      DateTime    @default(now()) @map("created_at")
 
   // Phase 2A addition — docs/architecture/15-task-conversation.md "Activity feed reuses
   // the audit log". Nullable/additive: every Phase 1 write path is untouched; call sites
@@ -777,11 +869,17 @@ model AuditLog {
   // activity history becomes one indexed query over this same table, never a parallel one.
   workdayId String? @map("workday_id")
 
-  organization Organization? @relation(fields: [organizationId], references: [id])
-  actor        User          @relation(fields: [actorId], references: [id])
-  task         Task?         @relation("AuditLogTask", fields: [taskId], references: [id])
-  project      Project?      @relation("AuditLogProject", fields: [projectId], references: [id], onDelete: SetNull)
-  workday      Workday?      @relation(fields: [workdayId], references: [id], onDelete: SetNull)
+  // Phase 7 addition — docs/architecture/26-phase7-calendar-meeting-architecture-report.md
+  // §16. Fifth use of the same additive-nullable-column pattern: a calendar event's full
+  // activity history becomes one indexed query over this same table, never a parallel one.
+  calendarEventId String? @map("calendar_event_id")
+
+  organization  Organization?  @relation(fields: [organizationId], references: [id])
+  actor         User           @relation(fields: [actorId], references: [id])
+  task          Task?          @relation("AuditLogTask", fields: [taskId], references: [id])
+  project       Project?       @relation("AuditLogProject", fields: [projectId], references: [id], onDelete: SetNull)
+  workday       Workday?       @relation(fields: [workdayId], references: [id], onDelete: SetNull)
+  calendarEvent CalendarEvent? @relation(fields: [calendarEventId], references: [id], onDelete: SetNull)
 
   @@index([organizationId])
   @@index([entityType, entityId])
@@ -789,6 +887,7 @@ model AuditLog {
   @@index([taskId, createdAt])
   @@index([projectId, createdAt])
   @@index([workdayId, createdAt])
+  @@index([calendarEventId, createdAt])
   @@map("audit_logs")
 }
 
@@ -846,36 +945,36 @@ model Conversation {
   project  Project?               @relation(fields: [projectId], references: [id], onDelete: Cascade)
   messages TaskMessage[]
   reads    TaskConversationRead[]
+  // CHECK (exactly one of task_id / project_id set) added via raw-SQL migration
 
   // Table name intentionally left as "task_conversations" (not renamed to "conversations")
   // — Prisma's migration diffing treats an @@map rename as DROP+CREATE, which would have
   // destroyed this table's existing rows. Only the Prisma-level model name changed
   // (TaskConversation -> Conversation); the physical table is untouched, zero data risk.
   @@map("task_conversations")
-  // CHECK (exactly one of task_id / project_id set) added via raw-SQL migration
 }
 
 // Always human-authored (see NotificationService/AuditLog for system-generated events —
 // doc 15 "system activity is never a fake TaskMessage row").
 model TaskMessage {
-  id                String    @id @default(uuid())
-  conversationId    String    @map("conversation_id")
-  senderId          String    @map("sender_id")
-  parentMessageId   String?   @map("parent_message_id")
-  body              String
-  isEdited          Boolean   @default(false) @map("is_edited")
-  editedAt          DateTime? @map("edited_at")
-  isDeleted         Boolean   @default(false) @map("is_deleted")
-  deletedAt         DateTime? @map("deleted_at")
-  createdAt         DateTime  @default(now()) @map("created_at")
+  id              String    @id @default(uuid())
+  conversationId  String    @map("conversation_id")
+  senderId        String    @map("sender_id")
+  parentMessageId String?   @map("parent_message_id")
+  body            String
+  isEdited        Boolean   @default(false) @map("is_edited")
+  editedAt        DateTime? @map("edited_at")
+  isDeleted       Boolean   @default(false) @map("is_deleted")
+  deletedAt       DateTime? @map("deleted_at")
+  createdAt       DateTime  @default(now()) @map("created_at")
 
-  conversation    Conversation          @relation(fields: [conversationId], references: [id], onDelete: Cascade)
-  sender          User                  @relation(fields: [senderId], references: [id])
-  parentMessage   TaskMessage?          @relation("MessageReplies", fields: [parentMessageId], references: [id])
-  replies         TaskMessage[]         @relation("MessageReplies")
-  mentions        TaskMessageMention[]
-  reactions       TaskMessageReaction[]
-  attachments     TaskAttachment[]
+  conversation  Conversation          @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sender        User                  @relation(fields: [senderId], references: [id])
+  parentMessage TaskMessage?          @relation("MessageReplies", fields: [parentMessageId], references: [id])
+  replies       TaskMessage[]         @relation("MessageReplies")
+  mentions      TaskMessageMention[]
+  reactions     TaskMessageReaction[]
+  attachments   TaskAttachment[]
 
   @@index([conversationId, createdAt])
   @@index([parentMessageId])
@@ -883,10 +982,10 @@ model TaskMessage {
 }
 
 model TaskMessageMention {
-  id               String   @id @default(uuid())
-  messageId        String   @map("message_id")
-  mentionedUserId  String   @map("mentioned_user_id")
-  createdAt        DateTime @default(now()) @map("created_at")
+  id              String   @id @default(uuid())
+  messageId       String   @map("message_id")
+  mentionedUserId String   @map("mentioned_user_id")
+  createdAt       DateTime @default(now()) @map("created_at")
 
   message       TaskMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
   mentionedUser User        @relation(fields: [mentionedUserId], references: [id])
@@ -918,8 +1017,8 @@ model TaskConversationRead {
   userId         String   @map("user_id")
   lastReadAt     DateTime @map("last_read_at")
 
-  conversation Conversation     @relation(fields: [conversationId], references: [id], onDelete: Cascade)
-  user         User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@id([conversationId, userId])
   @@map("task_conversation_reads")
@@ -948,7 +1047,7 @@ model Workday {
   // User.defaultTimezone at write time, never from raw server `now()` alone (doc 19 §12,
   // §31 — this is the fix for the pre-existing timezone bug in ReportingService's
   // bucketByDueDate). @db.Date keeps this unambiguous: a plain date, not an instant.
-  workDate       DateTime  @db.Date @map("work_date")
+  workDate       DateTime  @map("work_date") @db.Date
   // Set once, lazily, on first engagement with that day — "starting the day" is an
   // implicit side effect of touching any Phase 3 endpoint that date, not a button the
   // user must remember to press first (doc 19 §5/§22).
@@ -975,31 +1074,31 @@ model Workday {
 // CarryForward, DailyReview) folds into fields on this one table rather than becoming a
 // separate entity — see doc 19 §11 for the per-concept justification.
 model DailyPlanItem {
-  id        String              @id @default(uuid())
-  workdayId String              @map("workday_id")
-  taskId    String              @map("task_id")
-  status    DailyPlanItemStatus @default(PLANNED)
+  id                     String              @id @default(uuid())
+  workdayId              String              @map("workday_id")
+  taskId                 String              @map("task_id")
+  status                 DailyPlanItemStatus @default(PLANNED)
   // App-assigned ordering within the day (drag-and-drop is a UI concern over this same
   // field, not a new data need — doc 19 §6).
-  position  Int                 @default(0)
+  position               Int                 @default(0)
   // User-declared, never clock-inferred (doc 19 §18): true only when the user explicitly
   // marks an item as "wasn't part of my original plan," not derived from when it was added.
-  isUnplanned Boolean           @default(false) @map("is_unplanned")
+  isUnplanned            Boolean             @default(false) @map("is_unplanned")
   // The day-specific estimate — deliberately separate from Task.estimatedDurationMinutes
   // (doc 19 §13): the task's own field is a general, set-once default; this is "what I
   // actually expect to spend on it today," which may legitimately differ.
-  plannedDurationMinutes Int?   @map("planned_duration_minutes")
+  plannedDurationMinutes Int?                @map("planned_duration_minutes")
   // Optional "I intend to do this from X to Y today" — no conflict-detection, no
   // calendar-grid UI; just a hook a future Calendar phase can plot against with zero
   // schema change (doc 19 §16/§23).
-  scheduledStart DateTime?      @map("scheduled_start")
-  scheduledEnd   DateTime?      @map("scheduled_end")
+  scheduledStart         DateTime?           @map("scheduled_start")
+  scheduledEnd           DateTime?           @map("scheduled_end")
   // First "Start" press / "Complete" press — one coarse actual-elapsed-time signal,
   // deliberately without WorkSession-style pause/resume history (doc 19 §17). Never
   // caller-supplied; always set to the server's `now()` by the transition endpoints that
   // own them (doc 19 §28 — prevents falsified time entries).
-  startedAt   DateTime?         @map("started_at")
-  completedAt DateTime?         @map("completed_at")
+  startedAt              DateTime?           @map("started_at")
+  completedAt            DateTime?           @map("completed_at")
   // Carry-forward chain — a status transition plus a link, not a new entity (doc 19 §19).
   // Points at the prior day's item this one continues from. The reverse direction ("what
   // was I carried to") is a simple reverse lookup (findFirst where carriedFromItemId =
@@ -1009,17 +1108,17 @@ model DailyPlanItem {
   // to preserve full bidirectional history without the added complexity of a dual-FK
   // self-relation on one model (a deliberate simplification over doc 19 §12's two-column
   // sketch — identical guarantees, fewer moving parts).
-  carriedFromItemId String?          @map("carried_from_item_id")
-  createdAt DateTime  @default(now()) @map("created_at")
-  updatedAt DateTime  @updatedAt @map("updated_at")
+  carriedFromItemId      String?             @map("carried_from_item_id")
+  createdAt              DateTime            @default(now()) @map("created_at")
+  updatedAt              DateTime            @updatedAt @map("updated_at")
 
-  workday        Workday         @relation(fields: [workdayId], references: [id], onDelete: Cascade)
+  workday          Workday         @relation(fields: [workdayId], references: [id], onDelete: Cascade)
   // Tasks are never hard-deleted in this codebase (only cancelled — doc 05) — this
   // cascade is a structural safety net for an unreachable case today, not an active path,
   // matching the same reasoning already used for Workspace's owner cascade.
-  task              Task            @relation(fields: [taskId], references: [id], onDelete: Cascade)
-  carriedFromItem   DailyPlanItem?  @relation("CarryForwardChain", fields: [carriedFromItemId], references: [id], onDelete: SetNull)
-  carriedForwardTo  DailyPlanItem[] @relation("CarryForwardChain")
+  task             Task            @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  carriedFromItem  DailyPlanItem?  @relation("CarryForwardChain", fields: [carriedFromItemId], references: [id], onDelete: SetNull)
+  carriedForwardTo DailyPlanItem[] @relation("CarryForwardChain")
 
   // A task can appear AT MOST ONCE per specific day's plan (prevents duplicate planning
   // the same day) while remaining fully plannable again on a DIFFERENT day, since

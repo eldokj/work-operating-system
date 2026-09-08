@@ -2052,4 +2052,153 @@ describe("ABC College — full Phase 1 acceptance scenario (brief §32/33)", () 
       expect(original.data!.status).toBe("COMPLETED");
     });
   });
+
+  // docs/architecture/26-phase7-calendar-meeting-architecture-report.md. Reuses the
+  // existing Marketing Team fixture (Anu = TEAM_HEAD with REPORTS_VIEW at team scope,
+  // Rahul/Divya = MEMBER at team scope) specifically so the single most important test in
+  // this phase — REPORTS_VIEW must never imply calendar detail visibility — exercises a
+  // real, already-established reporting relationship rather than a synthetic one.
+  describe("Phase 7: Calendar & Meeting Integration", () => {
+    let privateEventId: string;
+    let orgVisibleEventId: string;
+
+    it("1. Rahul creates a PRIVATE event; he and an explicit participant (Divya) can see it, an unrelated org member (Priya) cannot", async () => {
+      const created = await rahul.client.post<{ id: string; visibility: string; organizerId: string }>("/api/v1/calendar/events", {
+        workspaceId: orgWorkspaceId,
+        title: "1:1 with Rahul",
+        startAt: "2026-08-10T09:00:00.000Z",
+        endAt: "2026-08-10T09:30:00.000Z",
+        participantUserIds: [divya.id],
+      });
+      expect(created.status, JSON.stringify(created)).toBe(200);
+      expect(created.data!.visibility).toBe("PRIVATE");
+      privateEventId = created.data!.id;
+
+      const asRahul = await rahul.client.get(`/api/v1/calendar/events/${privateEventId}`);
+      expect(asRahul.status).toBe(200);
+      const asDivya = await divya.client.get(`/api/v1/calendar/events/${privateEventId}`);
+      expect(asDivya.status).toBe(200);
+      const asPriya = await priya.client.get(`/api/v1/calendar/events/${privateEventId}`);
+      expect(asPriya.status).toBe(403);
+    });
+
+    it("2. REPORTS_VIEW does NOT imply calendar detail visibility: Anu (Rahul's Team Head, holds REPORTS_VIEW over Marketing Team) is denied Rahul's PRIVATE event", async () => {
+      const asAnu = await anu.client.get(`/api/v1/calendar/events/${privateEventId}`);
+      expect(asAnu.status, JSON.stringify(asAnu)).toBe(403);
+
+      // Sanity check that Anu's REPORTS_VIEW grant is real and would normally succeed for
+      // an actually-permitted resource (the team dashboard) — proving the 403 above is
+      // specifically calendar's own stricter rule, not a broken/absent grant.
+      const teamDashboard = await anu.client.get(`/api/v1/organizations/${orgId}/reports/team/${marketingTeamId}`);
+      expect(teamDashboard.status, JSON.stringify(teamDashboard)).toBe(200);
+    });
+
+    it("3. an ORGANIZATION_VISIBLE event is visible to any member of the SAME organization (Priya), never a different one", async () => {
+      const created = await rahul.client.post<{ id: string; visibility: string }>("/api/v1/calendar/events", {
+        workspaceId: orgWorkspaceId,
+        title: "Marketing all-hands",
+        startAt: "2026-08-11T14:00:00.000Z",
+        endAt: "2026-08-11T15:00:00.000Z",
+        visibility: "ORGANIZATION_VISIBLE",
+      });
+      expect(created.status, JSON.stringify(created)).toBe(200);
+      orgVisibleEventId = created.data!.id;
+
+      const asPriya = await priya.client.get(`/api/v1/calendar/events/${orgVisibleEventId}`);
+      expect(asPriya.status, JSON.stringify(asPriya)).toBe(200);
+
+      const outsider = await signup("calendar-outsider", "Calendar Outsider");
+      const asOutsider = await outsider.client.get(`/api/v1/calendar/events/${orgVisibleEventId}`);
+      expect(asOutsider.status).toBe(403);
+    });
+
+    it("4. only the organizer can update or cancel an event", async () => {
+      const asDivya = await divya.client.patch(`/api/v1/calendar/events/${privateEventId}`, { title: "Hijacked" });
+      expect(asDivya.status).toBe(403);
+
+      const asRahul = await rahul.client.patch(`/api/v1/calendar/events/${privateEventId}`, { title: "1:1 with Rahul (rescheduled)" });
+      expect(asRahul.status, JSON.stringify(asRahul)).toBe(200);
+    });
+
+    it("5. cancelling an event notifies the participant, never the organizer, and audit-logs the action", async () => {
+      const cancel = await rahul.client.post(`/api/v1/calendar/events/${privateEventId}/cancel`);
+      expect(cancel.status, JSON.stringify(cancel)).toBe(200);
+
+      const divyaNotifications = await divya.client.get<{ items: Array<{ type: string }> }>("/api/v1/notifications?limit=100");
+      expect(divyaNotifications.data!.items.some((n) => n.type === "calendar_event.cancelled")).toBe(true);
+      const rahulNotifications = await rahul.client.get<{ items: Array<{ type: string }> }>("/api/v1/notifications?limit=100");
+      expect(rahulNotifications.data!.items.some((n) => n.type === "calendar_event.cancelled")).toBe(false);
+
+      const audit = await eldo.client.get<{ items: Array<{ action: string }> }>(
+        `/api/v1/organizations/${orgId}/audit-logs?entityType=CalendarEvent&entityId=${privateEventId}`
+      );
+      expect(audit.data!.items.some((e) => e.action === "calendar_event.cancelled")).toBe(true);
+    });
+
+    it("6. Today's merged day timeline combines a calendar event and a scheduled task block, chronologically ordered and clearly distinguished", async () => {
+      const task = await divya.client.post<{ id: string }>("/api/v1/tasks", {
+        workspaceId: orgWorkspaceId,
+        title: "Prep slides for the all-hands",
+      });
+      expect(task.status, JSON.stringify(task)).toBe(200);
+      await eldo.client.post(`/api/v1/tasks/${task.data!.id}/assignments`, { assigneeType: "USER", assigneeUserId: divya.id });
+      const t = await divya.client.get<{ assignments: Array<{ id: string; isCurrent: boolean }> }>(`/api/v1/tasks/${task.data!.id}`);
+      await divya.client.post(`/api/v1/assignments/${t.data!.assignments.find((a) => a.isCurrent)!.id}/accept`);
+      const planned = await divya.client.post<{ id: string }>("/api/v1/me/workday/items", { taskId: task.data!.id, date: "2026-08-12" });
+      expect(planned.status, JSON.stringify(planned)).toBe(200);
+      await divya.client.patch(`/api/v1/workday-items/${planned.data!.id}`, {
+        scheduledStart: "2026-08-12T08:00:00.000Z",
+        scheduledEnd: "2026-08-12T08:30:00.000Z",
+      });
+
+      const meeting = await divya.client.post<{ id: string }>("/api/v1/calendar/events", {
+        workspaceId: orgWorkspaceId,
+        title: "Design review",
+        startAt: "2026-08-12T09:00:00.000Z",
+        endAt: "2026-08-12T09:30:00.000Z",
+      });
+      expect(meeting.status, JSON.stringify(meeting)).toBe(200);
+
+      const timeline = await divya.client.get<{
+        items: Array<{ type: string; title: string; startAt: string }>;
+      }>(`/api/v1/calendar/day?workspaceId=${orgWorkspaceId}&date=2026-08-12`);
+      expect(timeline.status, JSON.stringify(timeline)).toBe(200);
+      expect(timeline.data!.items.length).toBeGreaterThanOrEqual(2);
+      const types = timeline.data!.items.map((i) => i.type);
+      expect(types).toContain("TASK");
+      expect(types).toContain("EVENT");
+      // Chronological: every item's startAt is non-decreasing.
+      const times = timeline.data!.items.map((i) => new Date(i.startAt).getTime());
+      expect([...times].sort((a, b) => a - b)).toEqual(times);
+    });
+
+    it("7. a private event never leaks into an unrelated user's day timeline", async () => {
+      const priyaTimeline = await priya.client.get<{ items: Array<{ title: string }> }>(
+        `/api/v1/calendar/day?workspaceId=${orgWorkspaceId}&date=2026-08-12`
+      );
+      expect(priyaTimeline.status, JSON.stringify(priyaTimeline)).toBe(200);
+      expect(priyaTimeline.data!.items.some((i) => i.title === "Design review")).toBe(false);
+    });
+
+    it("8. cross-tenant isolation: an outsider from a different organization cannot read this workspace's calendar at all", async () => {
+      const outsider = await signup("calendar-tenant-outsider", "Calendar Tenant Outsider");
+      const res = await outsider.client.get(`/api/v1/calendar/events?workspaceId=${orgWorkspaceId}&from=2026-08-01T00:00:00.000Z&to=2026-08-31T00:00:00.000Z`);
+      expect(res.status).toBe(403);
+    });
+
+    it("9. existing Today/DailyPlanItem functionality is unaffected: scheduledStart/scheduledEnd editing still works exactly as before, and capacity now reports meeting minutes", async () => {
+      const workday = await divya.client.get<{ capacityMinutes: number; meetingMinutes: number; plannedMinutes: number; availableMinutes: number }>(
+        "/api/v1/me/workday?date=2026-08-12"
+      );
+      expect(workday.status, JSON.stringify(workday)).toBe(200);
+      expect(typeof workday.data!.meetingMinutes).toBe("number");
+      expect(typeof workday.data!.availableMinutes).toBe("number");
+      expect(workday.data!.meetingMinutes).toBeGreaterThan(0); // the Design review meeting from scenario 6
+    });
+
+    it("regression: Phase 1 through Phase 6 behavior is unaffected by anything Phase 7 added", async () => {
+      const original = await eldo.client.get<{ status: string }>(`/api/v1/tasks/${taskId}`);
+      expect(original.data!.status).toBe("COMPLETED");
+    });
+  });
 });

@@ -6,7 +6,7 @@ import type {
   UpdateDailyPlanItemInput,
 } from "@ai-task-manager/shared";
 import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from "../errors";
-import { resolveLocalDate } from "../local-day";
+import { localDayBounds, resolveLocalDate } from "../local-day";
 import {
   canDeleteDailyPlanItem,
   canTransitionDailyPlanItem,
@@ -131,7 +131,7 @@ export class DailyWorkService {
     const workDate = await this.resolveWorkDate(actorId, dateStr);
     const [workday, user] = await Promise.all([
       this.db.workday.findUnique({ where: { userId_workDate: { userId: actorId, workDate } } }),
-      this.db.user.findUniqueOrThrow({ where: { id: actorId }, select: { workingHours: true } }),
+      this.db.user.findUniqueOrThrow({ where: { id: actorId }, select: { workingHours: true, defaultTimezone: true } }),
     ]);
 
     let plannedMinutes = 0;
@@ -143,6 +143,9 @@ export class DailyWorkService {
       plannedMinutes = items.reduce((sum, i) => sum + (i.plannedDurationMinutes ?? i.task.estimatedDurationMinutes ?? 0), 0);
     }
 
+    const capacityMinutes = computeCapacityMinutes(user.workingHours, workDate);
+    const meetingMinutes = await this.computeMeetingMinutes(actorId, user.defaultTimezone, dateStr);
+
     return {
       workDate: workDate.toISOString().slice(0, 10),
       status: (!workday ? "NOT_STARTED" : workday.closedAt ? "CLOSED" : "OPEN") as "NOT_STARTED" | "OPEN" | "CLOSED",
@@ -150,9 +153,42 @@ export class DailyWorkService {
       startedAt: workday?.startedAt ?? null,
       closedAt: workday?.closedAt ?? null,
       reflectionNote: workday?.reflectionNote ?? null,
-      capacityMinutes: computeCapacityMinutes(user.workingHours, workDate),
+      capacityMinutes,
+      // Phase 7 — docs/architecture/26-phase7-calendar-meeting-architecture-report.md §10.
+      // Available minutes = capacity − meeting time − already-planned task time. Clamped
+      // to zero, never negative (an overcommitted day is shown as 0 available, not -90).
+      meetingMinutes,
       plannedMinutes,
+      availableMinutes: Math.max(0, capacityMinutes - meetingMinutes - plannedMinutes),
     };
+  }
+
+  /**
+   * doc 26 §10: sums CONFIRMED, non-all-day CalendarEvent duration (organizer or
+   * participant) overlapping this local calendar day, clipped to the day's own instant
+   * boundaries (not further clipped to the exact working-hours sub-window — doc 26 §10's
+   * own accepted simplification: "good enough," not overbuilt). All-day events are
+   * deliberately excluded (doc 26 §10) — treating them as consuming the full advisory
+   * capacity is ambiguous and not modeled precisely in v1.
+   */
+  private async computeMeetingMinutes(actorId: string, timezone: string, dateStr?: string): Promise<number> {
+    const anchor = dateStr ? new Date(`${dateStr}T12:00:00.000Z`) : new Date();
+    const { start, end } = localDayBounds(anchor, timezone);
+    const events = await this.db.calendarEvent.findMany({
+      where: {
+        status: "CONFIRMED",
+        isAllDay: false,
+        startAt: { lte: end },
+        endAt: { gte: start },
+        OR: [{ organizerId: actorId }, { participants: { some: { userId: actorId } } }],
+      },
+      select: { startAt: true, endAt: true },
+    });
+    return events.reduce((sum, e) => {
+      const clippedStart = Math.max(e.startAt.getTime(), start.getTime());
+      const clippedEnd = Math.min(e.endAt.getTime(), end.getTime());
+      return sum + Math.max(0, (clippedEnd - clippedStart) / 60_000);
+    }, 0);
   }
 
   /** Idempotent: lazily creates the Workday if absent, sets startedAt if unset (doc 19

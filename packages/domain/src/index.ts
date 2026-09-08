@@ -25,3 +25,4 @@ export * from "./services/storage.service";
 export * from "./services/daily-work.service";
 export * from "./services/search.service";
 export * from "./services/scheduler.service";
+export * from "./services/calendar.service";

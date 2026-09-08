@@ -37,7 +37,10 @@ interface WorkdaySummary {
   closedAt: string | null;
   reflectionNote: string | null;
   capacityMinutes: number;
+  // Phase 7 — docs/architecture/26-phase7-calendar-meeting-architecture-report.md §10.
+  meetingMinutes: number;
   plannedMinutes: number;
+  availableMinutes: number;
 }
 interface InboxTask {
   id: string;
@@ -45,6 +48,38 @@ interface InboxTask {
   status: string;
   priority: string;
   dueDate: string | null;
+}
+
+// Phase 7 — the Today page's merged day timeline (doc 26 §17/§18/§19). A read-only
+// projection over CalendarEvent + scheduled DailyPlanItem, never a third source of truth.
+interface TimelineEventSummary {
+  id: string;
+  title: string;
+  startAt: string;
+  endAt: string;
+  isAllDay: boolean;
+  location: string | null;
+  meetingLink: string | null;
+  organizerId: string;
+}
+interface TimelineTaskSummary {
+  id: string;
+  task: { id: string; title: string; status: string; priority: string };
+}
+interface DayTimelineItem {
+  type: "EVENT" | "TASK";
+  id: string;
+  title: string;
+  startAt: string;
+  endAt: string;
+  hasConflict: boolean;
+  event: TimelineEventSummary | null;
+  task: TimelineTaskSummary | null;
+}
+interface DayTimeline {
+  date: string;
+  items: DayTimelineItem[];
+  unscheduledTaskCount: number;
 }
 
 const UNRESOLVED_STATUSES = ["PLANNED", "IN_PROGRESS"];
@@ -63,6 +98,7 @@ export default function TodayPage() {
   const [items, setItems] = useState<DailyPlanItem[]>([]);
   const [inbox, setInbox] = useState<InboxTask[]>([]);
   const [yesterday, setYesterday] = useState<WorkdaySummary | null>(null);
+  const [timeline, setTimeline] = useState<DayTimeline | null>(null);
   const [tab, setTab] = useState<Tab>("Plan");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -87,6 +123,13 @@ export default function TodayPage() {
         .get<WorkdaySummary>(`/api/v1/me/workday?date=${yStr}`)
         .then((yw) => setYesterday(yw.status === "OPEN" ? yw : null))
         .catch(() => setYesterday(null));
+
+      // Phase 7 — the merged day timeline (doc 26 §17/§18). Non-blocking, same as
+      // yesterday's read above: a calendar hiccup must never break the rest of Today.
+      api
+        .get<DayTimeline>(`/api/v1/calendar/day?workspaceId=${currentWorkspaceId}&date=${w.workDate}`)
+        .then(setTimeline)
+        .catch(() => setTimeline(null));
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Could not load today");
     }
@@ -143,6 +186,10 @@ export default function TodayPage() {
         <div className="flex items-center justify-between text-xs text-slate-500">
           <span>
             {workday.plannedMinutes} / {workday.capacityMinutes} min planned
+            {/* Phase 7 — doc 26 §10: capacity now accounts for meeting time, not just
+               planned task time, so this number stops being fictional on meeting-heavy
+               days. */}
+            {workday.meetingMinutes > 0 && <span className="text-slate-400"> · {workday.meetingMinutes} min in meetings</span>}
           </span>
           {overCapacity && <span className="font-medium text-amber-700">Over capacity</span>}
         </div>
@@ -152,7 +199,17 @@ export default function TodayPage() {
             style={{ width: `${workday.capacityMinutes > 0 ? Math.min(100, (workday.plannedMinutes / workday.capacityMinutes) * 100) : 0}%` }}
           />
         </div>
+        {workday.capacityMinutes > 0 && (
+          <p className="text-xs text-slate-400">{workday.availableMinutes} min realistically available today</p>
+        )}
       </div>
+
+      <DayTimelineCard
+        timeline={timeline}
+        workspaceId={currentWorkspaceId}
+        disabled={workday.status === "CLOSED"}
+        onCreated={load}
+      />
 
       <div className="flex gap-1 border-b border-slate-200">
         {(["Plan", "Work", "Close"] as Tab[]).map((t) => (
@@ -231,6 +288,152 @@ function ItemTaskLine({ task }: { task: TaskRef }) {
         <StatusBadge status={task.status} />
         {task.project && <span className="badge bg-slate-100 text-slate-500">{task.project.name}</span>}
         {task.dueDate && <span className="text-xs text-slate-400">Due {new Date(task.dueDate).toLocaleDateString()}</span>}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Phase 7 — docs/architecture/26-phase7-calendar-meeting-architecture-report.md §17/§19.
+ * "What does my day actually look like" (START) — meetings and scheduled task blocks in
+ * one chronological list. Read-only display plus a lightweight event-creation form; no
+ * drag-and-drop, no month/week grid (doc 26 §19/§23 — Calendar supports Today, it doesn't
+ * become a separate destination).
+ */
+function DayTimelineCard({
+  timeline,
+  workspaceId,
+  disabled,
+  onCreated,
+}: {
+  timeline: DayTimeline | null;
+  workspaceId: string | null;
+  disabled: boolean;
+  onCreated: () => void;
+}) {
+  const [showForm, setShowForm] = useState(false);
+
+  const fmtTime = (iso: string) => new Date(iso).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+
+  return (
+    <div className="card space-y-3 p-4">
+      <div className="flex items-center justify-between">
+        <h2 className="text-sm font-semibold text-slate-700">Your day</h2>
+        {!disabled && workspaceId && (
+          <button className="btn-secondary text-xs" onClick={() => setShowForm((s) => !s)}>
+            {showForm ? "Cancel" : "+ Add meeting"}
+          </button>
+        )}
+      </div>
+
+      {showForm && workspaceId && (
+        <NewCalendarEventForm
+          workspaceId={workspaceId}
+          onDone={() => {
+            setShowForm(false);
+            onCreated();
+          }}
+          onCancel={() => setShowForm(false)}
+        />
+      )}
+
+      {!timeline || timeline.items.length === 0 ? (
+        <p className="text-sm text-slate-400">Nothing scheduled to a specific time yet today.</p>
+      ) : (
+        <div className="space-y-1.5">
+          {timeline.items.map((item) => (
+            <div
+              key={`${item.type}-${item.id}`}
+              className={`flex items-center gap-2 rounded-lg border p-2 text-sm ${item.hasConflict ? "border-amber-300 bg-amber-50" : "border-slate-100"}`}
+            >
+              <span className="w-28 shrink-0 text-xs text-slate-500">
+                {fmtTime(item.startAt)} – {fmtTime(item.endAt)}
+              </span>
+              <span className={`badge shrink-0 ${item.type === "EVENT" ? "bg-violet-50 text-violet-700" : "bg-slate-100 text-slate-500"}`}>
+                {item.type === "EVENT" ? "Meeting" : "Task"}
+              </span>
+              {item.type === "TASK" && item.task ? (
+                <Link href={`/tasks/${item.task.task.id}`} className="min-w-0 flex-1 truncate font-medium text-slate-800 hover:underline">
+                  {item.title}
+                </Link>
+              ) : (
+                <span className="min-w-0 flex-1 truncate font-medium text-slate-800">
+                  {item.title}
+                  {item.event?.location && <span className="ml-1.5 text-xs text-slate-400">@ {item.event.location}</span>}
+                </span>
+              )}
+              {item.hasConflict && <span className="shrink-0 text-xs font-medium text-amber-700">Overlaps</span>}
+            </div>
+          ))}
+        </div>
+      )}
+      {timeline && timeline.unscheduledTaskCount > 0 && (
+        <p className="text-xs text-slate-400">
+          {timeline.unscheduledTaskCount} more planned {timeline.unscheduledTaskCount === 1 ? "task has" : "tasks have"} no specific time set —
+          see the Plan tab below.
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** A lightweight, single-workspace-member meeting/time-block form — title/time/location/
+ * link only (doc 26 §19/§23: no participant picker in v1's UI, though the backend already
+ * supports participants via a separate API call — organizer-only creation still delivers
+ * the core capacity-accuracy value on its own). */
+function NewCalendarEventForm({ workspaceId, onDone, onCancel }: { workspaceId: string; onDone: () => void; onCancel: () => void }) {
+  const [title, setTitle] = useState("");
+  const [startLocal, setStartLocal] = useState("");
+  const [endLocal, setEndLocal] = useState("");
+  const [location, setLocation] = useState("");
+  const [meetingLink, setMeetingLink] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  async function submit() {
+    if (!title.trim() || !startLocal || !endLocal) return;
+    setSaving(true);
+    setError(null);
+    try {
+      await api.post("/api/v1/calendar/events", {
+        workspaceId,
+        title: title.trim(),
+        startAt: new Date(startLocal).toISOString(),
+        endAt: new Date(endLocal).toISOString(),
+        location: location.trim() || null,
+        meetingLink: meetingLink.trim() || null,
+      });
+      onDone();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not create event");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="space-y-2 rounded-lg border border-slate-200 p-3">
+      {error && <p className="text-xs text-red-600">{error}</p>}
+      <input className="input" placeholder="Meeting title" value={title} onChange={(e) => setTitle(e.target.value)} />
+      <div className="flex gap-2">
+        <div className="flex-1">
+          <label className="label text-xs">Start</label>
+          <input type="datetime-local" className="input" value={startLocal} onChange={(e) => setStartLocal(e.target.value)} />
+        </div>
+        <div className="flex-1">
+          <label className="label text-xs">End</label>
+          <input type="datetime-local" className="input" value={endLocal} onChange={(e) => setEndLocal(e.target.value)} />
+        </div>
+      </div>
+      <input className="input" placeholder="Location (optional)" value={location} onChange={(e) => setLocation(e.target.value)} />
+      <input className="input" placeholder="Meeting link (optional)" value={meetingLink} onChange={(e) => setMeetingLink(e.target.value)} />
+      <div className="flex justify-end gap-2">
+        <button className="btn-secondary text-xs" onClick={onCancel}>
+          Cancel
+        </button>
+        <button className="btn-primary text-xs" disabled={saving || !title.trim() || !startLocal || !endLocal} onClick={submit}>
+          Add to my day
+        </button>
       </div>
     </div>
   );

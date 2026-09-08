@@ -2,9 +2,16 @@
 export function describeNotification(type: string, payload: Record<string, unknown>): string {
   // message.added / task.mentioned can originate from a project's own conversation as
   // well as a task's (Phase 2C, doc 17 §11) — payload carries projectTitle instead of
-  // taskTitle in that case.
+  // taskTitle in that case. Phase 7's two calendar notification types carry eventTitle
+  // instead of either (doc 26 §15) — there is no task/project involved.
   const title =
-    typeof payload.taskTitle === "string" ? payload.taskTitle : typeof payload.projectTitle === "string" ? payload.projectTitle : "a task";
+    typeof payload.taskTitle === "string"
+      ? payload.taskTitle
+      : typeof payload.projectTitle === "string"
+        ? payload.projectTitle
+        : typeof payload.eventTitle === "string"
+          ? payload.eventTitle
+          : "a task";
   switch (type) {
     case "task.assigned":
       return `You were assigned: "${title}"`;
@@ -35,6 +42,10 @@ export function describeNotification(type: string, payload: Record<string, unkno
       return `New message on "${title}"`;
     case "task.mentioned":
       return `You were mentioned on "${title}"`;
+    case "meeting.starting_soon":
+      return `Starting soon: "${title}"`;
+    case "calendar_event.cancelled":
+      return `Cancelled: "${title}"`;
     default:
       return `Update on "${title}"`;
   }

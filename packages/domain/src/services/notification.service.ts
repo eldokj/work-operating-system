@@ -23,6 +23,11 @@ export const NotificationType = {
   // Phase 2A additions — docs/architecture/15-task-conversation.md.
   MESSAGE_ADDED: "message.added",
   MENTIONED_IN_TASK: "task.mentioned",
+  // Phase 7 additions — docs/architecture/26-phase7-calendar-meeting-architecture-report.md
+  // §15. Deliberately only these two: event-changed/participant-added are named there as
+  // explicitly deferred (COULD HAVE), not built now.
+  MEETING_STARTING_SOON: "meeting.starting_soon",
+  CALENDAR_EVENT_CANCELLED: "calendar_event.cancelled",
 } as const;
 export type NotificationTypeValue = (typeof NotificationType)[keyof typeof NotificationType];
 

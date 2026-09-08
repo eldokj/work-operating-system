@@ -9,7 +9,7 @@ import { PrismaClient } from "@ai-task-manager/db";
 import bcrypt from "bcryptjs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { NotificationType } from "./notification.service";
-import { runScheduledChecks } from "./scheduler.service";
+import { MEETING_STARTING_SOON_WINDOW_MS, runScheduledChecks } from "./scheduler.service";
 
 const DEFAULT_LOCAL_DB_URL = "postgresql://app:app_dev_password@localhost:5433/ai_task_manager?schema=public";
 const prisma = new PrismaClient({
@@ -52,6 +52,33 @@ async function createAssignedTask(opts: { assigneeId: string; dueDate: Date | nu
     },
   });
   return task;
+}
+
+/** A minimal organizer(+optional participant) CalendarEvent, mirroring
+ * createAssignedTask's fixture-realism style — doc 26 §15. */
+async function createCalendarEvent(opts: {
+  organizerId: string;
+  participantId?: string;
+  startAt: Date;
+  isAllDay?: boolean;
+  status?: "CONFIRMED" | "CANCELLED";
+}) {
+  const workspace = await prisma.workspace.create({ data: { type: "PERSONAL", ownerUserId: opts.organizerId, name: "Personal" } });
+  const event = await prisma.calendarEvent.create({
+    data: {
+      workspaceId: workspace.id,
+      organizerId: opts.organizerId,
+      title: `Scheduler test meeting ${randomUUID()}`,
+      startAt: opts.startAt,
+      endAt: new Date(opts.startAt.getTime() + HOUR),
+      isAllDay: opts.isAllDay ?? false,
+      status: opts.status ?? "CONFIRMED",
+    },
+  });
+  if (opts.participantId) {
+    await prisma.calendarEventParticipant.create({ data: { eventId: event.id, userId: opts.participantId } });
+  }
+  return event;
 }
 
 describe("runScheduledChecks — Phase 6 scheduler", () => {
@@ -251,5 +278,92 @@ describe("runScheduledChecks — Phase 6 scheduler", () => {
     expect(notifications).toHaveLength(2);
     expect(notifications[0]!.type).toBe(NotificationType.DEADLINE_APPROACHING);
     expect(notifications[1]!.type).toBe(NotificationType.TASK_OVERDUE);
+  });
+
+  // doc 26 §15 — Phase 7's one new scheduled check, reusing the exact conditional-claim
+  // idempotency pattern above.
+  describe("tickMeetingStartingSoon (Phase 7)", () => {
+    it("fires MEETING_STARTING_SOON exactly once for organizer and participant, within the window", async () => {
+      const organizer = await createUser("meeting-organizer");
+      const participant = await createUser("meeting-participant");
+      await createCalendarEvent({
+        organizerId: organizer.id,
+        participantId: participant.id,
+        startAt: new Date(NOW.getTime() + 10 * 60 * 1000), // 10 minutes out, within the 15-minute window
+      });
+
+      const first = await runScheduledChecks(prisma, NOW);
+      expect(first.meetingStartingSoon).toBe(1);
+
+      const organizerNotifications = await prisma.notification.findMany({
+        where: { userId: organizer.id, type: NotificationType.MEETING_STARTING_SOON },
+      });
+      expect(organizerNotifications).toHaveLength(1);
+      const participantNotifications = await prisma.notification.findMany({
+        where: { userId: participant.id, type: NotificationType.MEETING_STARTING_SOON },
+      });
+      expect(participantNotifications).toHaveLength(1);
+
+      // No duplicate on a later tick.
+      await runScheduledChecks(prisma, new Date(NOW.getTime() + 60 * 1000));
+      const stillOne = await prisma.notification.findMany({
+        where: { userId: organizer.id, type: NotificationType.MEETING_STARTING_SOON },
+      });
+      expect(stillOne).toHaveLength(1);
+    });
+
+    it("does not fire for an event starting beyond the window", async () => {
+      const organizer = await createUser("meeting-far");
+      await createCalendarEvent({ organizerId: organizer.id, startAt: new Date(NOW.getTime() + 45 * 60 * 1000) });
+
+      await runScheduledChecks(prisma, NOW);
+      const notifications = await prisma.notification.findMany({ where: { userId: organizer.id, type: NotificationType.MEETING_STARTING_SOON } });
+      expect(notifications).toHaveLength(0);
+    });
+
+    it("never fires for a CANCELLED event", async () => {
+      const organizer = await createUser("meeting-cancelled");
+      await createCalendarEvent({ organizerId: organizer.id, startAt: new Date(NOW.getTime() + 5 * 60 * 1000), status: "CANCELLED" });
+
+      await runScheduledChecks(prisma, NOW);
+      const notifications = await prisma.notification.findMany({ where: { userId: organizer.id, type: NotificationType.MEETING_STARTING_SOON } });
+      expect(notifications).toHaveLength(0);
+    });
+
+    it("never fires for an all-day event", async () => {
+      const organizer = await createUser("meeting-allday");
+      await createCalendarEvent({ organizerId: organizer.id, startAt: new Date(NOW.getTime() + 5 * 60 * 1000), isAllDay: true });
+
+      await runScheduledChecks(prisma, NOW);
+      const notifications = await prisma.notification.findMany({ where: { userId: organizer.id, type: NotificationType.MEETING_STARTING_SOON } });
+      expect(notifications).toHaveLength(0);
+    });
+
+    it("notifies only the organizer and listed participants — an unrelated user never receives it (information-disclosure boundary)", async () => {
+      const organizer = await createUser("meeting-disclosure-organizer");
+      const bystander = await createUser("meeting-disclosure-bystander");
+      await createCalendarEvent({ organizerId: organizer.id, startAt: new Date(NOW.getTime() + 5 * 60 * 1000) });
+
+      await runScheduledChecks(prisma, NOW);
+      const bystanderNotifications = await prisma.notification.findMany({
+        where: { userId: bystander.id, type: NotificationType.MEETING_STARTING_SOON },
+      });
+      expect(bystanderNotifications).toHaveLength(0);
+    });
+
+    it("idempotency under concurrency: two ticks racing on the same event produce exactly one notification", async () => {
+      const organizer = await createUser("meeting-race");
+      await createCalendarEvent({ organizerId: organizer.id, startAt: new Date(NOW.getTime() + 5 * 60 * 1000) });
+
+      const [a, b] = await Promise.all([runScheduledChecks(prisma, NOW), runScheduledChecks(prisma, NOW)]);
+      expect(a.meetingStartingSoon + b.meetingStartingSoon).toBe(1);
+
+      const notifications = await prisma.notification.findMany({ where: { userId: organizer.id, type: NotificationType.MEETING_STARTING_SOON } });
+      expect(notifications).toHaveLength(1);
+    });
+
+    it("the lookahead window matches the tick interval exactly, by design (doc 26 §15)", () => {
+      expect(MEETING_STARTING_SOON_WINDOW_MS).toBe(15 * 60 * 1000);
+    });
   });
 });

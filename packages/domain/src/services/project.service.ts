@@ -52,6 +52,15 @@ export class ProjectService {
     return project;
   }
 
+  /** Same as getProjectRawByIdOrThrow, batched — one query for any number of ids, not one
+   * query per id (doc 22 §8/§10 — Phase 5's SearchService uses this to avoid an N+1 fetch
+   * before its own per-candidate canAccessProject re-check). Missing ids are silently
+   * omitted, not an error. */
+  async getProjectsRawByIds(projectIds: string[]): Promise<ProjectDetail[]> {
+    if (projectIds.length === 0) return [];
+    return this.db.project.findMany({ where: { id: { in: projectIds } }, include: PROJECT_INCLUDE });
+  }
+
   async canAccessProject(userId: string, project: ProjectWithWorkspace): Promise<boolean> {
     return canAccessProject(this.db, this.permissions, userId, project);
   }

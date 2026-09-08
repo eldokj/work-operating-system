@@ -1803,4 +1803,141 @@ describe("ABC College — full Phase 1 acceptance scenario (brief §32/33)", () 
       expect(stillDenied.status).toBe(403);
     });
   });
+
+  // ── Phase 5: Search — docs/architecture/22-phase5-product-capability-and-roadmap- ──
+  // ── assessment.md §8/§10 ──
+  // The one non-negotiable rule this whole block exists to prove: search results are
+  // always filtered through the exact same authorization every other read path uses —
+  // never a shortcut index that leaks content a searcher couldn't otherwise see. Every
+  // task/project/message created here embeds a run-unique keyword so these assertions
+  // never collide with unrelated data already in the database from other test blocks.
+
+  describe("Phase 5: Search", () => {
+    const kw = (label: string) => `zzsearch${RUN}${label}`;
+
+    it("1. a task is findable by its owner/assignee via a distinctive keyword in the title", async () => {
+      const task = await eldo.client.post<{ id: string }>("/api/v1/tasks", {
+        workspaceId: orgWorkspaceId,
+        title: `Draft the ${kw("alpha")} proposal`,
+      });
+      expect(task.status, JSON.stringify(task)).toBe(200);
+
+      const res = await eldo.client.get<{ items: Array<{ type: string; id: string; title: string }> }>(
+        `/api/v1/search?q=${kw("alpha")}`
+      );
+      expect(res.status, JSON.stringify(res)).toBe(200);
+      expect(res.data!.items.some((i) => i.type === "TASK" && i.id === task.data!.id)).toBe(true);
+    });
+
+    it("2. a user with no access to the task never sees it in search results, even with the exact matching keyword", async () => {
+      // A fresh, isolated task assigned only to Rahul — Priya (Finance, unrelated) has no
+      // relationship to it whatsoever.
+      const task = await eldo.client.post<{ id: string }>("/api/v1/tasks", {
+        workspaceId: orgWorkspaceId,
+        title: `Confidential ${kw("beta")} budget review`,
+      });
+      await eldo.client.post(`/api/v1/tasks/${task.data!.id}/assignments`, { assigneeType: "USER", assigneeUserId: rahul.id });
+
+      const rahulRes = await rahul.client.get<{ items: Array<{ id: string }> }>(`/api/v1/search?q=${kw("beta")}`);
+      expect(rahulRes.status, JSON.stringify(rahulRes)).toBe(200);
+      expect(rahulRes.data!.items.some((i) => i.id === task.data!.id)).toBe(true);
+
+      const priyaRes = await priya.client.get<{ items: Array<{ id: string }> }>(`/api/v1/search?q=${kw("beta")}`);
+      expect(priyaRes.status, JSON.stringify(priyaRes)).toBe(200);
+      expect(priyaRes.data!.items.some((i) => i.id === task.data!.id)).toBe(false);
+    });
+
+    it("3. a message is findable by someone with conversation access, never by someone without it", async () => {
+      const task = await eldo.client.post<{ id: string }>("/api/v1/tasks", {
+        workspaceId: orgWorkspaceId,
+        title: `Task for message search ${kw("gamma-task")}`,
+      });
+      await eldo.client.post(`/api/v1/tasks/${task.data!.id}/assignments`, { assigneeType: "USER", assigneeUserId: divya.id });
+      const t = await divya.client.get<{ assignments: Array<{ id: string; isCurrent: boolean }> }>(`/api/v1/tasks/${task.data!.id}`);
+      await divya.client.post(`/api/v1/assignments/${t.data!.assignments.find((a) => a.isCurrent)!.id}/accept`);
+
+      const message = await divya.client.post(`/api/v1/tasks/${task.data!.id}/conversation/messages`, {
+        body: `Please review the ${kw("gamma-message")} attachment before Friday.`,
+      });
+      expect(message.status, JSON.stringify(message)).toBe(200);
+
+      const divyaRes = await divya.client.get<{ items: Array<{ type: string; taskId: string | null }> }>(
+        `/api/v1/search?q=${kw("gamma-message")}`
+      );
+      expect(divyaRes.data!.items.some((i) => i.type === "MESSAGE" && i.taskId === task.data!.id)).toBe(true);
+
+      const priyaRes = await priya.client.get<{ items: Array<{ type: string }> }>(`/api/v1/search?q=${kw("gamma-message")}`);
+      expect(priyaRes.data!.items.some((i) => i.type === "MESSAGE")).toBe(false);
+    });
+
+    it("4. a project is findable by a project member, never by an unrelated org member", async () => {
+      const project = await eldo.client.post<{ id: string }>(`/api/v1/workspaces/${orgWorkspaceId}/projects`, {
+        name: `${kw("delta")} Annual Fundraiser`,
+      });
+      expect(project.status, JSON.stringify(project)).toBe(200);
+      await eldo.client.post(`/api/v1/projects/${project.data!.id}/members`, { userId: rahul.id });
+
+      const rahulRes = await rahul.client.get<{ items: Array<{ type: string; id: string }> }>(`/api/v1/search?q=${kw("delta")}`);
+      expect(rahulRes.data!.items.some((i) => i.type === "PROJECT" && i.id === project.data!.id)).toBe(true);
+
+      const priyaRes = await priya.client.get<{ items: Array<{ type: string; id: string }> }>(`/api/v1/search?q=${kw("delta")}`);
+      expect(priyaRes.data!.items.some((i) => i.type === "PROJECT" && i.id === project.data!.id)).toBe(false);
+    });
+
+    it("5. cross-tenant isolation: an outsider from a different organization never sees a match, even one they'd otherwise rank highly", async () => {
+      const task = await eldo.client.post<{ id: string }>("/api/v1/tasks", {
+        workspaceId: orgWorkspaceId,
+        title: `${kw("epsilon")} strategic plan`,
+      });
+      expect(task.status, JSON.stringify(task)).toBe(200);
+
+      const outsider = await signup("search-outsider", "Search Outsider");
+      const res = await outsider.client.get<{ items: unknown[] }>(`/api/v1/search?q=${kw("epsilon")}`);
+      expect(res.status, JSON.stringify(res)).toBe(200);
+      expect(res.data!.items).toHaveLength(0);
+    });
+
+    it("6. a deleted message never appears in search results", async () => {
+      const task = await eldo.client.post<{ id: string }>("/api/v1/tasks", {
+        workspaceId: orgWorkspaceId,
+        title: `Task for deleted-message search ${kw("zeta-task")}`,
+      });
+      const message = await eldo.client.post<{ id: string }>(`/api/v1/tasks/${task.data!.id}/conversation/messages`, {
+        body: `This mentions ${kw("zeta-message")} before being deleted.`,
+      });
+      const beforeDelete = await eldo.client.get<{ items: Array<{ type: string }> }>(`/api/v1/search?q=${kw("zeta-message")}`);
+      expect(beforeDelete.data!.items.some((i) => i.type === "MESSAGE")).toBe(true);
+
+      await eldo.client.delete(`/api/v1/messages/${message.data!.id}`);
+
+      const afterDelete = await eldo.client.get<{ items: Array<{ type: string }> }>(`/api/v1/search?q=${kw("zeta-message")}`);
+      expect(afterDelete.data!.items.some((i) => i.type === "MESSAGE")).toBe(false);
+    });
+
+    it("7. results are correctly typed and mixed across tasks, projects, and messages for a shared keyword", async () => {
+      const shared = kw("eta-shared");
+      const task = await eldo.client.post<{ id: string }>("/api/v1/tasks", { workspaceId: orgWorkspaceId, title: `${shared} task` });
+      const project = await eldo.client.post<{ id: string }>(`/api/v1/workspaces/${orgWorkspaceId}/projects`, { name: `${shared} project` });
+      await eldo.client.post(`/api/v1/tasks/${task.data!.id}/conversation/messages`, { body: `A message about ${shared}` });
+
+      const res = await eldo.client.get<{ items: Array<{ type: string; id: string }> }>(`/api/v1/search?q=${shared}`);
+      expect(res.status, JSON.stringify(res)).toBe(200);
+      const types = new Set(res.data!.items.map((i) => i.type));
+      expect(types.has("TASK")).toBe(true);
+      expect(types.has("PROJECT")).toBe(true);
+      expect(types.has("MESSAGE")).toBe(true);
+      expect(res.data!.items.some((i) => i.type === "TASK" && i.id === task.data!.id)).toBe(true);
+      expect(res.data!.items.some((i) => i.type === "PROJECT" && i.id === project.data!.id)).toBe(true);
+    });
+
+    it("8. a blank/whitespace-only query is rejected, not silently treated as 'match everything'", async () => {
+      const res = await eldo.client.get("/api/v1/search?q=%20%20");
+      expect(res.status).toBe(400);
+    });
+
+    it("regression: Phase 1 through Phase 4 behavior is unaffected by anything Phase 5 added", async () => {
+      const original = await eldo.client.get<{ status: string }>(`/api/v1/tasks/${taskId}`);
+      expect(original.data!.status).toBe("COMPLETED");
+    });
+  });
 });

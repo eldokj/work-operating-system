@@ -7,6 +7,7 @@ import { WorkspaceProvider, useWorkspace } from "@/lib/workspace-context";
 import { api } from "@/lib/api-client";
 import { QuickTaskBar } from "@/components/QuickTaskBar";
 import { NotificationBell } from "@/components/NotificationBell";
+import { SearchBar } from "@/components/SearchBar";
 
 function AppShell({ children }: { children: React.ReactNode }) {
   const { me, workspaces, currentWorkspaceId, currentOrg, setCurrentWorkspaceId, loading } = useWorkspace();
@@ -113,6 +114,7 @@ function AppShell({ children }: { children: React.ReactNode }) {
           <div className="flex-1">
             <QuickTaskBar workspaceId={currentWorkspaceId} isOrgWorkspace={!!currentOrg} organizationId={currentOrg?.organizationId ?? null} />
           </div>
+          <SearchBar />
           <NotificationBell />
         </header>
         <main className="flex-1 overflow-y-auto p-6">{children}</main>

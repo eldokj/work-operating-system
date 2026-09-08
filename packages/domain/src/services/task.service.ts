@@ -214,6 +214,15 @@ export class TaskService {
     return task;
   }
 
+  /** Same as getTaskRawByIdOrThrow, batched — one query for any number of ids, not one
+   * query per id. For callers (Phase 5's SearchService) re-checking authorization over a
+   * candidate set — doc 22 §8/§10: never a substitute for canViewTask, only a way to avoid
+   * an N+1 fetch before it. Missing ids are silently omitted, not an error. */
+  async getTasksRawByIds(taskIds: string[]): Promise<TaskWithDetail[]> {
+    if (taskIds.length === 0) return [];
+    return this.db.task.findMany({ where: { id: { in: taskIds } }, include: TASK_DETAIL_INCLUDE });
+  }
+
   async getTaskByIdOrThrow(actorId: string, taskId: string): Promise<TaskWithDetail> {
     const task = await this.db.task.findUnique({ where: { id: taskId }, include: TASK_DETAIL_INCLUDE });
     if (!task) throw new NotFoundError("Task not found");

@@ -23,3 +23,4 @@ export * from "./services/notification.service";
 export * from "./services/audit.service";
 export * from "./services/storage.service";
 export * from "./services/daily-work.service";
+export * from "./services/search.service";

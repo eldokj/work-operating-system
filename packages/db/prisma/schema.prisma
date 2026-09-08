@@ -95,6 +95,15 @@ enum ProjectStatus {
   ARCHIVED
 }
 
+// Phase 2C — docs/architecture/17-phase2c-project-workspace-architecture-report.md §4.
+// Purely presentational (icon/label/which Overview sections are emphasized) — drives no
+// authorization, task, conversation, or file behavior. "Annual Day 2026" is a Project row
+// with kind=EVENT; everything else about it works exactly like any other Project.
+enum ProjectKind {
+  PROJECT
+  EVENT
+}
+
 enum DependencyType {
   BLOCKS
   RELATES_TO
@@ -145,6 +154,10 @@ model User {
   messageMentions         TaskMessageMention[]
   messageReactions        TaskMessageReaction[]
   conversationReads       TaskConversationRead[]
+  projectMemberships      ProjectMember[]         @relation("ProjectMemberUser")
+  projectMembersAdded     ProjectMember[]         @relation("ProjectMemberAddedBy")
+  projectTeamsAdded       ProjectTeam[]
+  projectDatesCreated     ProjectDate[]
 
   @@map("users")
 }
@@ -227,6 +240,7 @@ model Team {
   projects             Project[]
   assignmentsAsAssignee TaskAssignment[] @relation("AssignmentAssigneeTeam")
   originTasks          Task[]           @relation("TaskOriginTeam")
+  projectTeams          ProjectTeam[]
 
   @@index([organizationId])
   @@index([departmentId])
@@ -336,6 +350,12 @@ model Workspace {
   // CHECK (exactly one of owner_user_id / organization_id set) added via raw-SQL migration
 }
 
+// Phase 1 model, minimally wired until Phase 2C — docs/architecture/17-phase2c-
+// project-workspace-architecture-report.md §2/§6.1. Extended here (additive columns +
+// new relations only), never replaced: workspaceId/departmentId/teamId/ownerId/status
+// already correctly answer "which tenant, and which department/team gets credit for
+// creating it" — a different question from "who participates," which the new
+// ProjectMember/ProjectTeam rosters below answer (doc 17 §6.2/§6.3/§8).
 model Project {
   id           String        @id @default(uuid())
   workspaceId  String        @map("workspace_id")
@@ -345,16 +365,86 @@ model Project {
   description  String?
   ownerId      String        @map("owner_id")
   status       ProjectStatus @default(ACTIVE)
+  kind         ProjectKind   @default(PROJECT)
+  startDate    DateTime?     @map("start_date") @db.Date
+  targetDate   DateTime?     @map("target_date") @db.Date
   createdAt    DateTime      @default(now()) @map("created_at")
 
-  workspace  Workspace   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
-  department Department? @relation(fields: [departmentId], references: [id])
-  team       Team?       @relation(fields: [teamId], references: [id])
-  owner      User        @relation(fields: [ownerId], references: [id])
-  tasks      Task[]
+  workspace    Workspace         @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  department   Department?       @relation(fields: [departmentId], references: [id])
+  team         Team?             @relation(fields: [teamId], references: [id])
+  owner        User              @relation(fields: [ownerId], references: [id])
+  tasks        Task[]
+  members      ProjectMember[]
+  teams        ProjectTeam[]
+  dates        ProjectDate[]
+  conversation Conversation?
+  attachments  TaskAttachment[]
+  auditLogs    AuditLog[]        @relation("AuditLogProject")
 
   @@index([workspaceId])
   @@map("projects")
+}
+
+// Phase 2C — doc 17 §6.2. Explicit individual-participant roster for the People tab and
+// for project-level access (doc 17 §8/§9). Authoritative for PROJECT-level access only —
+// never for task-level accountability, which TaskAssignment alone continues to own
+// unconditionally.
+model ProjectMember {
+  id          String   @id @default(uuid())
+  projectId   String   @map("project_id")
+  userId      String   @map("user_id")
+  addedById   String   @map("added_by")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user    User    @relation("ProjectMemberUser", fields: [userId], references: [id], onDelete: Cascade)
+  addedBy User    @relation("ProjectMemberAddedBy", fields: [addedById], references: [id])
+
+  @@unique([projectId, userId])
+  @@index([userId])
+  @@map("project_members")
+}
+
+// Phase 2C — doc 17 §6.3. "This team participates in this project" — a declarative
+// membership decision (unlike a pending task-team-assignment), so unlike Phase 2A's
+// task-conversation narrowing, every current member of a participating team gets
+// baseline PROJECT-level access (doc 17 §8 explains why that's correct, not a
+// regression). Membership is read live off TeamMember, never snapshotted.
+model ProjectTeam {
+  id        String   @id @default(uuid())
+  projectId String   @map("project_id")
+  teamId    String   @map("team_id")
+  addedById String   @map("added_by")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  team    Team    @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  addedBy User    @relation(fields: [addedById], references: [id])
+
+  @@unique([projectId, teamId])
+  @@index([teamId])
+  @@map("project_teams")
+}
+
+// Phase 2C — doc 17 §6.6/§13. A labeled date, nothing more — deliberately not the
+// Calendar module (no recurrence, no reminders, no time-of-day) and deliberately not
+// linked to any Task.dueDate (a project milestone like "Guest Confirmation" isn't
+// necessarily one task's deadline).
+model ProjectDate {
+  id          String    @id @default(uuid())
+  projectId   String    @map("project_id")
+  title       String
+  date        DateTime  @db.Date
+  notes       String?
+  createdById String    @map("created_by")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  createdBy User    @relation(fields: [createdById], references: [id])
+
+  @@index([projectId, date])
+  @@map("project_dates")
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -407,8 +497,8 @@ model Task {
   tags              TaskTag[]
   notifications     Notification[]
   // Phase 2A — docs/architecture/15-task-conversation.md. Exactly one per task, enforced
-  // by the unique constraint on TaskConversation.taskId below.
-  conversation      TaskConversation?
+  // by the unique constraint on Conversation.taskId (widened for Phase 2C — doc 17 §6.4).
+  conversation      Conversation?
   auditLogs         AuditLog[]          @relation("AuditLogTask")
 
   @@index([workspaceId])
@@ -505,12 +595,18 @@ model TaskUpdate {
 // (seeded in the original doc 03 schema, never wired to any service/route/UI until now) —
 // extended here rather than replaced, per that phase's instruction to reuse an existing
 // attachment concept if one exists. `commentId` is the pre-existing, still-untouched link
-// to the old TaskComment feature; `messageId` is the new Phase 2A TaskMessage link. Binary
+// to the old TaskComment feature; `messageId` is the Phase 2A TaskMessage link. Binary
 // content is never stored here — `storagePath` is an opaque, server-generated key into the
 // StorageService, never a client-supplied path or the original filename.
+//
+// Phase 2C — docs/architecture/17-phase2c-project-workspace-architecture-report.md §6.5:
+// `taskId` widened from required to nullable, `projectId` added, with a CHECK constraint
+// ensuring exactly one of the two is ever set — by construction, an attachment can never
+// carry a taskId/projectId pair that disagree about which workspace it belongs to.
 model TaskAttachment {
   id           String    @id @default(uuid())
-  taskId       String    @map("task_id")
+  taskId       String?   @map("task_id")
+  projectId    String?   @map("project_id")
   commentId    String?   @map("comment_id")
   messageId    String?   @map("message_id")
   uploadedById String    @map("uploaded_by")
@@ -522,12 +618,14 @@ model TaskAttachment {
   deletedAt    DateTime? @map("deleted_at")
   createdAt    DateTime  @default(now()) @map("created_at")
 
-  task       Task         @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  task       Task?        @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  project    Project?     @relation(fields: [projectId], references: [id], onDelete: Cascade)
   comment    TaskComment? @relation(fields: [commentId], references: [id])
   message    TaskMessage? @relation(fields: [messageId], references: [id], onDelete: SetNull)
   uploadedBy User         @relation(fields: [uploadedById], references: [id])
 
   @@index([taskId, createdAt])
+  @@index([projectId, createdAt])
   @@index([messageId])
   @@map("task_attachments")
 }
@@ -628,14 +726,22 @@ model AuditLog {
   // instead of a parallel event-sourcing table.
   taskId String? @map("task_id")
 
+  // Phase 2C addition — docs/architecture/17-phase2c-project-workspace-architecture-report.md
+  // §6.7/§15. Third use of this exact additive-nullable-column pattern (after taskId
+  // above in Phase 2A): a project's full activity history becomes one indexed query over
+  // this same table, never a parallel one.
+  projectId String? @map("project_id")
+
   organization Organization? @relation(fields: [organizationId], references: [id])
   actor        User          @relation(fields: [actorId], references: [id])
   task         Task?         @relation("AuditLogTask", fields: [taskId], references: [id])
+  project      Project?      @relation("AuditLogProject", fields: [projectId], references: [id], onDelete: SetNull)
 
   @@index([organizationId])
   @@index([entityType, entityId])
   @@index([actorId])
   @@index([taskId, createdAt])
+  @@index([projectId, createdAt])
   @@map("audit_logs")
 }
 
@@ -669,19 +775,37 @@ model AiInteraction {
 // table (see doc 15 for why).
 // ─────────────────────────────────────────────────────────────────────────
 
-// Exactly one per task — the unique `taskId` is what makes "no duplicate primary
-// conversations" a database guarantee, not just an application convention.
-model TaskConversation {
+// Exactly one per task OR one per project — the unique `taskId`/`projectId` (each unique
+// individually) plus the CHECK constraint added in the Phase 2C migration
+// (docs/architecture/17-phase2c-project-workspace-architecture-report.md §6.4) are what
+// make "no duplicate primary conversation" and "never both/neither" database guarantees,
+// not just application convention.
+//
+// Generalized from Phase 2A's TaskConversation (task-only) rather than duplicated into a
+// parallel ProjectConversation model — TaskMessage/TaskMessageMention/
+// TaskMessageReaction/TaskConversationRead are completely unchanged by this, since they
+// only ever reference conversationId, never taskId directly. Authorization is still
+// enforced in code, never by this table: a task-scoped conversation follows
+// canAccessConversation (Phase 2A, unchanged); a project-scoped one follows project
+// membership (doc 17 §8/§9) — see ConversationService.
+model Conversation {
   id             String   @id @default(uuid())
-  taskId         String   @unique @map("task_id")
-  organizationId String?  @map("organization_id") // denormalized from task.workspace, query convenience only — never authoritative
+  taskId         String?  @unique @map("task_id")
+  projectId      String?  @unique @map("project_id")
+  organizationId String?  @map("organization_id") // denormalized from task/project's workspace, query convenience only — never authoritative
   createdAt      DateTime @default(now()) @map("created_at")
 
-  task     Task                  @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  task     Task?                  @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  project  Project?               @relation(fields: [projectId], references: [id], onDelete: Cascade)
   messages TaskMessage[]
   reads    TaskConversationRead[]
 
+  // Table name intentionally left as "task_conversations" (not renamed to "conversations")
+  // — Prisma's migration diffing treats an @@map rename as DROP+CREATE, which would have
+  // destroyed this table's existing rows. Only the Prisma-level model name changed
+  // (TaskConversation -> Conversation); the physical table is untouched, zero data risk.
   @@map("task_conversations")
+  // CHECK (exactly one of task_id / project_id set) added via raw-SQL migration
 }
 
 // Always human-authored (see NotificationService/AuditLog for system-generated events —
@@ -698,7 +822,7 @@ model TaskMessage {
   deletedAt         DateTime? @map("deleted_at")
   createdAt         DateTime  @default(now()) @map("created_at")
 
-  conversation    TaskConversation      @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  conversation    Conversation          @relation(fields: [conversationId], references: [id], onDelete: Cascade)
   sender          User                  @relation(fields: [senderId], references: [id])
   parentMessage   TaskMessage?          @relation("MessageReplies", fields: [parentMessageId], references: [id])
   replies         TaskMessage[]         @relation("MessageReplies")
@@ -747,7 +871,7 @@ model TaskConversationRead {
   userId         String   @map("user_id")
   lastReadAt     DateTime @map("last_read_at")
 
-  conversation TaskConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  conversation Conversation     @relation(fields: [conversationId], references: [id], onDelete: Cascade)
   user         User             @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@id([conversationId, userId])

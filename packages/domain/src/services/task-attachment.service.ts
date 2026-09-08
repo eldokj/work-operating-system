@@ -8,8 +8,10 @@ import {
 } from "../attachment-policy";
 import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from "../errors";
 import { canAccessConversation } from "../permission-engine/conversation-access";
+import { canAccessProject } from "../permission-engine/project-access";
 import { AuditService } from "./audit.service";
 import { PermissionService } from "./permission.service";
+import { ProjectService, type ProjectDetail } from "./project.service";
 import { LocalDiskStorageService, type StorageService } from "./storage.service";
 import { TaskService, type TaskWithDetail } from "./task.service";
 
@@ -21,7 +23,8 @@ export interface UploadFileInput {
 
 export interface AttachmentDTO {
   id: string;
-  taskId: string;
+  taskId: string | null;
+  projectId: string | null;
   messageId: string | null;
   fileName: string;
   mimeType: string;
@@ -40,6 +43,7 @@ function toDTO(row: RawAttachment): AttachmentDTO {
   return {
     id: row.id,
     taskId: row.taskId,
+    projectId: row.projectId,
     messageId: row.messageId,
     fileName: row.fileName,
     mimeType: row.mimeType,
@@ -49,23 +53,37 @@ function toDTO(row: RawAttachment): AttachmentDTO {
   };
 }
 
+/** What every attachment operation needs, regardless of whether it's task- or
+ * project-scoped — resolved once by resolveTaskContext/resolveProjectContext below. */
+interface OwnerContext {
+  kind: "TASK" | "PROJECT";
+  entityId: string;
+  organizationId: string | null;
+  workspace: { organizationId: string | null; ownerUserId: string | null };
+}
+
 /**
- * Work Files & Attachments — docs/architecture/16-work-files-attachments.md.
+ * Work Files & Attachments — docs/architecture/16-work-files-attachments.md, extended in
+ * Phase 2C (docs/architecture/17-phase2c-project-workspace-architecture-report.md §12) to
+ * also support project-scoped files, reusing every piece of this service rather than
+ * duplicating it.
  *
  * Extends the pre-existing (Phase 1, previously unused) TaskAttachment model rather than
  * introducing a competing one. Holds no authorization logic of its own beyond a single
- * call into the shared canAccessConversation predicate (see assertCanAccessAttachment) —
- * attachment access is conversation access, uniformly, whether or not a given attachment
- * happens to be linked to a message. (An earlier version of this file split that into two
- * rules — task access for unlinked uploads, conversation access for linked ones — which a
- * test caught letting a plain team member upload/list files while a task sat
- * team-pending; unifying to one rule removed the gap.)
+ * call into the shared canAccessConversation/canAccessProject predicates — attachment
+ * access is conversation/project access, uniformly, whether or not a given attachment
+ * happens to be linked to a message. (An earlier version of the task-only path split
+ * access into two rules — task access for unlinked uploads, conversation access for
+ * linked ones — which a test caught letting a plain team member upload/list files while a
+ * task sat team-pending; unifying to one rule removed the gap, and the same unified
+ * approach is used for the project path here.)
  *
  * PostgreSQL stores metadata only; binary content lives behind the StorageService
  * abstraction (local disk in dev, S3-compatible in production — doc 16 §Storage).
  */
 export class TaskAttachmentService {
   private readonly tasks: TaskService;
+  private readonly projects: ProjectService;
   private readonly permissions: PermissionService;
   private readonly audit: AuditService;
   private readonly storage: StorageService;
@@ -75,61 +93,82 @@ export class TaskAttachmentService {
     storage?: StorageService
   ) {
     this.tasks = new TaskService(db);
+    this.projects = new ProjectService(db);
     this.permissions = new PermissionService(db);
     this.audit = new AuditService(db);
     this.storage = storage ?? new LocalDiskStorageService();
   }
 
-  /**
-   * Server-generated, opaque, tenant/task-scoped — never the original filename, never
-   * client-supplied (doc 16 §Storage keys). Tenant segment is derived from the task's own
-   * workspace, never from a client-supplied organization id.
-   */
-  private buildStorageKey(task: TaskWithDetail, attachmentId: string): string {
-    const tenantSegment = task.workspace.organizationId
-      ? `org_${task.workspace.organizationId}`
-      : `user_${task.workspace.ownerUserId}`;
-    return `${tenantSegment}/task_${task.id}/${attachmentId}`;
+  private async resolveTaskContext(taskId: string): Promise<{ task: TaskWithDetail; ctx: OwnerContext }> {
+    const task = await this.tasks.getTaskRawByIdOrThrow(taskId);
+    return {
+      task,
+      ctx: { kind: "TASK", entityId: task.id, organizationId: task.workspace.organizationId, workspace: task.workspace },
+    };
+  }
+
+  private async resolveProjectContext(projectId: string): Promise<{ project: ProjectDetail; ctx: OwnerContext }> {
+    const project = await this.projects.getProjectRawByIdOrThrow(projectId);
+    return {
+      project,
+      ctx: {
+        kind: "PROJECT",
+        entityId: project.id,
+        organizationId: project.workspace.organizationId,
+        workspace: project.workspace,
+      },
+    };
   }
 
   /**
-   * Uploading (task-level, not yet linked to any message) requires plain task visibility
-   * plus the same task.comment permission bar posting a message already uses — reasonable
-   * given uploading is itself a form of contributing to the task, and keeps this from being
-   * a fourth, independently-invented permission.
+   * Upload/list/retrieval authorization: attachment access is conversation access for a
+   * task-scoped attachment, project access for a project-scoped one — deliberately NOT
+   * plain task view access even for a direct upload with no messageId yet (doc 16
+   * §Authorization / doc 17 §12). See the class doc comment for why.
    */
-  /**
-   * Upload and retrieval/listing authorization: attachment access is conversation access,
-   * uniformly — deliberately NOT plain task access, even for a direct task-level upload
-   * with no messageId (doc 16 §Authorization). An earlier version of this service used
-   * the broader canViewTask for the messageId-null case, which turned out to let a plain
-   * team member upload/list files while the task sat team-pending — exactly the exposure
-   * the Phase 2A regression test (doc 15) exists to prevent, just reached through files
-   * instead of messages. Using one rule everywhere removes that gap and is simpler besides.
-   */
-  private async assertCanAccessAttachment(actorId: string, task: TaskWithDetail): Promise<void> {
-    if (!(await canAccessConversation(this.permissions, actorId, task))) {
-      throw new ForbiddenError("You do not have access to this task's files");
+  private async assertCanAccessAttachment(
+    actorId: string,
+    ctx: OwnerContext,
+    entity: TaskWithDetail | ProjectDetail
+  ): Promise<void> {
+    const allowed =
+      ctx.kind === "TASK"
+        ? await canAccessConversation(this.permissions, actorId, entity as TaskWithDetail)
+        : await canAccessProject(this.db, this.permissions, actorId, entity as ProjectDetail);
+    if (!allowed) throw new ForbiddenError("You do not have access to these files");
+  }
+
+  private async assertCanUpload(actorId: string, ctx: OwnerContext, entity: TaskWithDetail | ProjectDetail): Promise<void> {
+    await this.assertCanAccessAttachment(actorId, ctx, entity);
+    if (ctx.workspace.organizationId) {
+      await this.permissions.assertHasAnyGrantWithPermission(actorId, ctx.workspace.organizationId, PERMISSIONS.TASK_COMMENT);
     }
   }
 
-  private async assertCanUpload(actorId: string, task: TaskWithDetail): Promise<void> {
-    await this.assertCanAccessAttachment(actorId, task);
-    if (task.workspace.type === "ORGANIZATION") {
-      await this.permissions.assertHasAnyGrantWithPermission(actorId, task.workspace.organizationId!, PERMISSIONS.TASK_COMMENT);
-    }
+  /**
+   * Server-generated, opaque, tenant/context-scoped — never the original filename, never
+   * client-supplied (doc 16 §Storage keys). Tenant segment is derived from the owning
+   * task/project's own workspace, never from a client-supplied organization id.
+   */
+  private buildStorageKey(ctx: OwnerContext, attachmentId: string): string {
+    const tenantSegment = ctx.workspace.organizationId ? `org_${ctx.workspace.organizationId}` : `user_${ctx.workspace.ownerUserId}`;
+    const contextSegment = ctx.kind === "TASK" ? `task_${ctx.entityId}` : `project_${ctx.entityId}`;
+    return `${tenantSegment}/${contextSegment}/${attachmentId}`;
   }
 
-  async uploadAttachments(actorId: string, taskId: string, files: UploadFileInput[]): Promise<AttachmentDTO[]> {
+  /** Shared write path for both task- and project-scoped uploads — validates, writes to
+   * storage, then creates rows in one transaction, with orphan-cleanup on any failure
+   * (doc 16 §Upload flow, doc 17 §12 "reuse... never a second storage system"). */
+  private async writeAndCreateAttachments(
+    actorId: string,
+    ctx: OwnerContext,
+    files: UploadFileInput[]
+  ): Promise<AttachmentDTO[]> {
     if (files.length === 0) throw new ValidationError("No files were provided");
     if (files.length > MAX_ATTACHMENTS_PER_UPLOAD) {
       throw new ValidationError(`Cannot upload more than ${MAX_ATTACHMENTS_PER_UPLOAD} files at once`);
     }
 
-    const task = await this.tasks.getTaskRawByIdOrThrow(taskId);
-    await this.assertCanUpload(actorId, task);
-
-    // Validate every file before writing anything to storage (doc 16 §Upload flow).
     for (const file of files) {
       const result = validateFile({ fileName: file.fileName, mimeType: file.mimeType, sizeBytes: file.data.byteLength });
       if (!result.ok) throw new ValidationError(result.reason);
@@ -142,7 +181,7 @@ export class TaskAttachmentService {
         fileName: sanitizeFileNameForDisplay(file.fileName),
         mimeType: file.mimeType,
         data: file.data,
-        storagePath: this.buildStorageKey(task, id),
+        storagePath: this.buildStorageKey(ctx, id),
       };
     });
 
@@ -160,7 +199,8 @@ export class TaskAttachmentService {
           const row = await tx.taskAttachment.create({
             data: {
               id: p.id,
-              taskId,
+              taskId: ctx.kind === "TASK" ? ctx.entityId : null,
+              projectId: ctx.kind === "PROJECT" ? ctx.entityId : null,
               uploadedById: actorId,
               storagePath: p.storagePath,
               fileName: p.fileName,
@@ -171,12 +211,13 @@ export class TaskAttachmentService {
           });
           created.push(row);
           await txAudit.log({
-            organizationId: task.workspace.organizationId,
+            organizationId: ctx.organizationId,
             actorId,
             action: "attachment.uploaded",
             entityType: "TaskAttachment",
             entityId: row.id,
-            taskId,
+            taskId: ctx.kind === "TASK" ? ctx.entityId : undefined,
+            projectId: ctx.kind === "PROJECT" ? ctx.entityId : undefined,
             after: { fileName: p.fileName, mimeType: p.mimeType, sizeBytes: p.data.byteLength },
           });
         }
@@ -192,9 +233,21 @@ export class TaskAttachmentService {
     }
   }
 
+  async uploadAttachments(actorId: string, taskId: string, files: UploadFileInput[]): Promise<AttachmentDTO[]> {
+    const { task, ctx } = await this.resolveTaskContext(taskId);
+    await this.assertCanUpload(actorId, ctx, task);
+    return this.writeAndCreateAttachments(actorId, ctx, files);
+  }
+
+  async uploadAttachmentsForProject(actorId: string, projectId: string, files: UploadFileInput[]): Promise<AttachmentDTO[]> {
+    const { project, ctx } = await this.resolveProjectContext(projectId);
+    await this.assertCanUpload(actorId, ctx, project);
+    return this.writeAndCreateAttachments(actorId, ctx, files);
+  }
+
   async listForTask(actorId: string, taskId: string): Promise<AttachmentDTO[]> {
-    const task = await this.tasks.getTaskRawByIdOrThrow(taskId);
-    await this.assertCanAccessAttachment(actorId, task);
+    const { task, ctx } = await this.resolveTaskContext(taskId);
+    await this.assertCanAccessAttachment(actorId, ctx, task);
     const rows = await this.db.taskAttachment.findMany({
       where: { taskId, isDeleted: false },
       include: ATTACHMENT_INCLUDE,
@@ -203,18 +256,33 @@ export class TaskAttachmentService {
     return rows.map(toDTO);
   }
 
-  private async loadAttachmentAndTask(attachmentId: string) {
-    const attachment = await this.db.taskAttachment.findUnique({ where: { id: attachmentId }, include: ATTACHMENT_INCLUDE });
-    if (!attachment) throw new NotFoundError("Attachment not found");
-    const task = await this.tasks.getTaskRawByIdOrThrow(attachment.taskId);
-    return { attachment, task };
+  async listForProject(actorId: string, projectId: string): Promise<AttachmentDTO[]> {
+    const { project, ctx } = await this.resolveProjectContext(projectId);
+    await this.assertCanAccessAttachment(actorId, ctx, project);
+    const rows = await this.db.taskAttachment.findMany({
+      where: { projectId, isDeleted: false },
+      include: ATTACHMENT_INCLUDE,
+      orderBy: { createdAt: "desc" },
+    });
+    return rows.map(toDTO);
   }
 
-  async getAttachmentOrThrow(actorId: string, attachmentId: string): Promise<{ attachment: RawAttachment; task: TaskWithDetail }> {
-    const { attachment, task } = await this.loadAttachmentAndTask(attachmentId);
+  private async loadAttachmentAndContext(attachmentId: string) {
+    const attachment = await this.db.taskAttachment.findUnique({ where: { id: attachmentId }, include: ATTACHMENT_INCLUDE });
+    if (!attachment) throw new NotFoundError("Attachment not found");
+    if (attachment.taskId) {
+      const { task, ctx } = await this.resolveTaskContext(attachment.taskId);
+      return { attachment, ctx, entity: task as TaskWithDetail | ProjectDetail };
+    }
+    const { project, ctx } = await this.resolveProjectContext(attachment.projectId!);
+    return { attachment, ctx, entity: project as TaskWithDetail | ProjectDetail };
+  }
+
+  async getAttachmentOrThrow(actorId: string, attachmentId: string) {
+    const { attachment, ctx, entity } = await this.loadAttachmentAndContext(attachmentId);
     if (attachment.isDeleted) throw new NotFoundError("Attachment not found");
-    await this.assertCanAccessAttachment(actorId, task);
-    return { attachment, task };
+    await this.assertCanAccessAttachment(actorId, ctx, entity);
+    return { attachment, ctx, entity };
   }
 
   /** Retrieval: returns the file bytes plus display metadata, or a signed URL when the
@@ -237,7 +305,7 @@ export class TaskAttachmentService {
    * only — the physical bytes are kept (doc 16 §Deletion: "do not immediately hard-delete
    * data if that conflicts with audit/history"); a retention/cleanup job is future work. */
   async deleteAttachment(actorId: string, attachmentId: string): Promise<void> {
-    const { attachment, task } = await this.loadAttachmentAndTask(attachmentId);
+    const { attachment, ctx } = await this.loadAttachmentAndContext(attachmentId);
     if (attachment.isDeleted) return;
     if (attachment.uploadedById !== actorId) {
       throw new ForbiddenError("Only the uploader can delete this attachment");
@@ -245,12 +313,13 @@ export class TaskAttachmentService {
 
     await this.db.taskAttachment.update({ where: { id: attachmentId }, data: { isDeleted: true, deletedAt: new Date() } });
     await this.audit.log({
-      organizationId: task.workspace.organizationId,
+      organizationId: ctx.organizationId,
       actorId,
       action: "attachment.deleted",
       entityType: "TaskAttachment",
       entityId: attachmentId,
-      taskId: task.id,
+      taskId: ctx.kind === "TASK" ? ctx.entityId : undefined,
+      projectId: ctx.kind === "PROJECT" ? ctx.entityId : undefined,
     });
   }
 
@@ -269,6 +338,25 @@ export class TaskAttachmentService {
       const row = byId.get(id);
       if (!row || row.taskId !== taskId || row.isDeleted) {
         throw new ValidationError(`Attachment not found on this task: ${id}`);
+      }
+      if (row.uploadedById !== actorId) {
+        throw new ForbiddenError(`Only the uploader can attach this file to a message: ${id}`);
+      }
+      if (row.messageId) {
+        throw new ConflictError(`Attachment is already linked to another message: ${id}`);
+      }
+    }
+  }
+
+  /** Same as assertAttachmentsLinkable, for a project-scoped conversation (doc 17 §11). */
+  async assertAttachmentsLinkableForProject(actorId: string, projectId: string, attachmentIds: string[]): Promise<void> {
+    if (attachmentIds.length === 0) return;
+    const rows = await this.db.taskAttachment.findMany({ where: { id: { in: attachmentIds } } });
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    for (const id of attachmentIds) {
+      const row = byId.get(id);
+      if (!row || row.projectId !== projectId || row.isDeleted) {
+        throw new ValidationError(`Attachment not found on this project: ${id}`);
       }
       if (row.uploadedById !== actorId) {
         throw new ForbiddenError(`Only the uploader can attach this file to a message: ${id}`);

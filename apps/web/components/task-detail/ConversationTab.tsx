@@ -31,18 +31,36 @@ interface Message {
 
 const QUICK_EMOJIS = ["👍", "❤️", "🎉", "😂", "👀"];
 
+/** Task-scoped and project-scoped conversations use the exact same message model and UI —
+ * only the base URL differs (doc 17 §11, mirroring ConversationService's own
+ * generalization). `uploadPath` differs from `conversation`'s base because the file-upload
+ * route is named differently for a project (`/files`) than a task (`/attachments`) — see
+ * doc 17 §16's API contract. */
+export type ConversationScope =
+  | { kind: "TASK"; id: string }
+  | { kind: "PROJECT"; id: string };
+
+function scopeUrls(scope: ConversationScope) {
+  const base = scope.kind === "TASK" ? `/api/v1/tasks/${scope.id}` : `/api/v1/projects/${scope.id}`;
+  return {
+    conversation: `${base}/conversation`,
+    upload: scope.kind === "TASK" ? `${base}/attachments` : `${base}/files`,
+  };
+}
+
 export function ConversationTab({
-  taskId,
+  scope,
   currentUserId,
   mentionCandidates,
   onActivity,
 }: {
-  taskId: string;
+  scope: ConversationScope;
   currentUserId: string;
   mentionCandidates: PersonRef[];
   /** Called after any mutation, so the parent can refresh e.g. the Activity tab / unread badge. */
   onActivity?: () => void;
 }) {
+  const urls = scopeUrls(scope);
   const [messages, setMessages] = useState<Message[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -59,7 +77,7 @@ export function ConversationTab({
 
   async function load() {
     try {
-      const res = await api.get<{ items: Message[] }>(`/api/v1/tasks/${taskId}/conversation/messages?limit=50`);
+      const res = await api.get<{ items: Message[] }>(`${urls.conversation}/messages?limit=50`);
       setMessages(res.items);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Could not load conversation");
@@ -70,9 +88,9 @@ export function ConversationTab({
 
   useEffect(() => {
     load();
-    api.post(`/api/v1/tasks/${taskId}/conversation/read`).then(() => onActivity?.());
+    api.post(`${urls.conversation}/read`).then(() => onActivity?.());
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [taskId]);
+  }, [scope.kind, scope.id]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ block: "nearest" });
@@ -85,10 +103,10 @@ export function ConversationTab({
       let attachmentIds: string[] = [];
       if (pendingFiles.length > 0) {
         setUploading(true);
-        const uploaded = await api.uploadFiles<Array<{ id: string }>>(`/api/v1/tasks/${taskId}/attachments`, pendingFiles);
+        const uploaded = await api.uploadFiles<Array<{ id: string }>>(urls.upload, pendingFiles);
         attachmentIds = uploaded.map((a) => a.id);
       }
-      await api.post(`/api/v1/tasks/${taskId}/conversation/messages`, {
+      await api.post(`${urls.conversation}/messages`, {
         body: body.trim() || undefined,
         parentMessageId: replyingTo?.id ?? null,
         mentionedUserIds: selectedMentions.map((m) => m.id),
@@ -272,7 +290,11 @@ export function ConversationTab({
         )}
         {mentionPickerOpen && (
           <div className="flex flex-wrap gap-2 rounded bg-slate-50 p-2">
-            {mentionCandidates.length === 0 && <span className="text-xs text-slate-400">No one else has access to this task yet.</span>}
+            {mentionCandidates.length === 0 && (
+              <span className="text-xs text-slate-400">
+                No one else has access to this {scope.kind === "TASK" ? "task" : "project"} yet.
+              </span>
+            )}
             {mentionCandidates.map((p) => (
               <button
                 key={p.id}

@@ -253,7 +253,7 @@ export default function TaskDetailPage() {
 
       {tab === "Conversation" && (
         <ConversationTab
-          taskId={task.id}
+          scope={{ kind: "TASK", id: task.id }}
           currentUserId={me.id}
           mentionCandidates={mentionCandidates}
           onActivity={refreshUnread}
@@ -281,9 +281,9 @@ export default function TaskDetailPage() {
         </div>
       )}
 
-      {tab === "Files" && <FilesTab taskId={task.id} />}
+      {tab === "Files" && <FilesTab scope={{ kind: "TASK", id: task.id }} />}
 
-      {tab === "Activity" && <ActivityTab taskId={task.id} assignments={task.assignments} />}
+      {tab === "Activity" && <ActivityTab scope={{ kind: "TASK", id: task.id }} assignments={task.assignments} />}
     </div>
   );
 }

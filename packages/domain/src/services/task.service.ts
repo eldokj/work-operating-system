@@ -107,9 +107,9 @@ export class TaskService {
       // Phase 2A: every task gets exactly one primary conversation, created in the same
       // transaction as the task itself (docs/architecture/15-task-conversation.md) — never
       // lazily, so "duplicate primary conversation" isn't a race condition to guard
-      // against elsewhere. The unique constraint on TaskConversation.taskId is the
-      // database-level backstop for this invariant.
-      await tx.taskConversation.create({
+      // against elsewhere. The unique constraint on Conversation.taskId (generalized in
+      // Phase 2C — doc 17 §6.4) is the database-level backstop for this invariant.
+      await tx.conversation.create({
         data: { taskId: created.id, organizationId: workspace.organizationId ?? null },
       });
 

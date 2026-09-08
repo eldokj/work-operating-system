@@ -3,6 +3,7 @@ import { PERMISSIONS, type TaskListFilter } from "@ai-task-manager/shared";
 import { ForbiddenError, NotFoundError } from "../errors";
 import { isOverdue } from "../state-machines/task-status.machine";
 import { PermissionService } from "./permission.service";
+import { ProjectService } from "./project.service";
 import { TaskService, type TaskWithDetail } from "./task.service";
 
 function startOfDay(d: Date) {
@@ -49,10 +50,12 @@ function bucketByDueDate(tasks: TaskWithDetail[], now = new Date()) {
 export class ReportingService {
   private readonly permissions: PermissionService;
   private readonly tasks: TaskService;
+  private readonly projects: ProjectService;
 
   constructor(private readonly db: PrismaClient) {
     this.permissions = new PermissionService(db);
     this.tasks = new TaskService(db);
+    this.projects = new ProjectService(db);
   }
 
   async getPersonalDashboard(actorId: string, workspaceId: string) {
@@ -76,7 +79,10 @@ export class ReportingService {
       );
     }
 
-    const myProjects = await this.db.project.findMany({ where: { workspaceId }, orderBy: { createdAt: "desc" } });
+    // Phase 2C (doc 17 §2/§16): was a raw db.project.findMany over the whole workspace —
+    // the exact "lists everything" gap the report called out, fixed the same way
+    // /workspaces/:id/projects was: filtered to what the caller actually participates in.
+    const myProjects = await this.projects.listProjectsForUser(actorId, workspaceId);
 
     return {
       myTasks,

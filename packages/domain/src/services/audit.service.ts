@@ -17,6 +17,11 @@ export interface AuditLogEntry {
    * with one indexed lookup instead of re-deriving it from entityType/entityId per action.
    */
   taskId?: string | null;
+  /**
+   * Phase 2C addition (docs/architecture/17-phase2c-project-workspace-architecture-report.md
+   * §6.7/§15) — same pattern as taskId above, third use of it.
+   */
+  projectId?: string | null;
 }
 
 /**
@@ -42,6 +47,7 @@ export class AuditService {
         reason: entry.reason ?? null,
         source: entry.source ?? "API",
         taskId: entry.taskId ?? null,
+        projectId: entry.projectId ?? null,
       },
     });
   }
@@ -52,6 +58,21 @@ export class AuditService {
     const limit = opts.limit ?? 100;
     const rows = await this.db.auditLog.findMany({
       where: { taskId },
+      orderBy: { createdAt: "asc" },
+      take: limit + 1,
+      ...(opts.cursor ? { cursor: { id: opts.cursor }, skip: 1 } : {}),
+      include: { actor: { select: { id: true, fullName: true, email: true } } },
+    });
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+    return { items: page, nextCursor: hasMore ? page[page.length - 1]?.id ?? null : null };
+  }
+
+  /** Same as listForTask, for a project — doc 17 §15. */
+  async listForProject(projectId: string, opts: { limit?: number; cursor?: string } = {}) {
+    const limit = opts.limit ?? 100;
+    const rows = await this.db.auditLog.findMany({
+      where: { projectId },
       orderBy: { createdAt: "asc" },
       take: limit + 1,
       ...(opts.cursor ? { cursor: { id: opts.cursor }, skip: 1 } : {}),

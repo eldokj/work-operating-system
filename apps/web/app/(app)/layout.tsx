@@ -92,6 +92,7 @@ function AppShell({ children }: { children: React.ReactNode }) {
         <nav className="flex flex-1 flex-col gap-1">
           {navLink("/dashboard", "Dashboard")}
           {navLink("/tasks", "Tasks")}
+          {navLink("/projects", "Projects")}
           {currentOrg && navLink(`/organizations/${currentOrg.organizationId}/teams`, "Teams")}
           {currentOrg && navLink(`/organizations/${currentOrg.organizationId}`, "Organization")}
           {currentOrg && navLink(`/organizations/${currentOrg.organizationId}/audit`, "Audit history")}

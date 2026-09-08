@@ -1,6 +1,10 @@
 // Renders a human-readable line for each NotificationType (packages/domain/src/services/notification.service.ts).
 export function describeNotification(type: string, payload: Record<string, unknown>): string {
-  const title = typeof payload.taskTitle === "string" ? payload.taskTitle : "a task";
+  // message.added / task.mentioned can originate from a project's own conversation as
+  // well as a task's (Phase 2C, doc 17 §11) — payload carries projectTitle instead of
+  // taskTitle in that case.
+  const title =
+    typeof payload.taskTitle === "string" ? payload.taskTitle : typeof payload.projectTitle === "string" ? payload.projectTitle : "a task";
   switch (type) {
     case "task.assigned":
       return `You were assigned: "${title}"`;

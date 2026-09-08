@@ -90,9 +90,9 @@ export default function DashboardPage() {
           <h2 className="mb-3 text-sm font-semibold text-slate-700">My Projects</h2>
           <div className="flex flex-wrap gap-2">
             {data.myProjects.map((p) => (
-              <span key={p.id} className="badge bg-slate-100 text-slate-700">
+              <Link key={p.id} href={`/projects/${p.id}`} className="badge bg-slate-100 text-slate-700 hover:bg-slate-200">
                 {p.name}
-              </span>
+              </Link>
             ))}
           </div>
         </div>

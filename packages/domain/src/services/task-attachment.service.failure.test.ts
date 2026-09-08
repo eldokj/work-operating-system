@@ -61,7 +61,7 @@ describe("TaskAttachmentService — upload failure consistency", () => {
       data: { workspaceId: workspace.id, title: "Failure test task", createdById: userId, createdVia: "DIRECT" },
     });
     taskId = task.id;
-    await prisma.taskConversation.create({ data: { taskId } });
+    await prisma.conversation.create({ data: { taskId } });
   });
 
   afterAll(async () => {

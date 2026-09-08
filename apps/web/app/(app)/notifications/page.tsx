@@ -45,12 +45,12 @@ export default function NotificationsPage() {
               <span className="shrink-0 text-xs text-slate-400">{new Date(n.createdAt).toLocaleString()}</span>
             </div>
           );
-          return n.relatedTaskId ? (
-            <Link
-              key={n.id}
-              href={`/tasks/${n.relatedTaskId}`}
-              onClick={() => api.post(`/api/v1/notifications/${n.id}/read`)}
-            >
+          // Phase 2C (doc 17 §11): a project-scoped conversation notification has no
+          // relatedTaskId (that column stays task-only) but carries payload.projectId.
+          const projectId = typeof n.payload.projectId === "string" ? n.payload.projectId : null;
+          const href = n.relatedTaskId ? `/tasks/${n.relatedTaskId}` : projectId ? `/projects/${projectId}` : null;
+          return href ? (
+            <Link key={n.id} href={href} onClick={() => api.post(`/api/v1/notifications/${n.id}/read`)}>
               {content}
             </Link>
           ) : (

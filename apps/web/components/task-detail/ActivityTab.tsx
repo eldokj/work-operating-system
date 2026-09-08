@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { api, ApiError } from "@/lib/api-client";
 import { AssignmentChain } from "@/components/AssignmentChain";
+import type { ConversationScope } from "./ConversationTab";
 
 interface AssignmentRow {
   id: string;
@@ -46,25 +47,42 @@ const ACTION_LABEL: Record<string, string> = {
   "task.message_deleted": "deleted a message",
   "attachment.uploaded": "uploaded a file",
   "attachment.deleted": "deleted a file",
+  // Project/Event Workspace — Phase 2C (doc 17 §16). A project has no assignment chain
+  // (that stays exactly the task-level TaskAssignment mechanism, doc 17 §7/§10 — untouched
+  // here), so these are the only project-specific labels; project.message_* etc. are
+  // covered above since Conversation is the same model for both.
+  "project.created": "created the project",
+  "project.updated": "updated the project",
+  "project.archived": "archived the project",
+  "project.member_added": "added a member",
+  "project.member_removed": "removed a member",
+  "project.team_added": "added a team",
+  "project.team_removed": "removed a team",
+  "project_date.created": "added an important date",
+  "project_date.updated": "updated an important date",
+  "project_date.deleted": "removed an important date",
 };
 
-export function ActivityTab({ taskId, assignments }: { taskId: string; assignments: AssignmentRow[] }) {
+export function ActivityTab({ scope, assignments }: { scope: ConversationScope; assignments?: AssignmentRow[] }) {
   const [entries, setEntries] = useState<ActivityEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    const path = scope.kind === "TASK" ? `/api/v1/tasks/${scope.id}/activity` : `/api/v1/projects/${scope.id}/activity`;
     api
-      .get<{ items: ActivityEntry[] }>(`/api/v1/tasks/${taskId}/activity?limit=100`)
+      .get<{ items: ActivityEntry[] }>(`${path}?limit=100`)
       .then((r) => setEntries(r.items))
       .catch((e) => setError(e instanceof ApiError ? e.message : "Could not load activity"));
-  }, [taskId]);
+  }, [scope.kind, scope.id]);
 
   return (
     <div className="space-y-4">
-      <div className="card p-4">
-        <h2 className="mb-3 text-sm font-semibold text-slate-700">Assignment history</h2>
-        <AssignmentChain assignments={assignments} />
-      </div>
+      {assignments && (
+        <div className="card p-4">
+          <h2 className="mb-3 text-sm font-semibold text-slate-700">Assignment history</h2>
+          <AssignmentChain assignments={assignments} />
+        </div>
+      )}
 
       <div className="card p-4">
         <h2 className="mb-3 text-sm font-semibold text-slate-700">System activity</h2>

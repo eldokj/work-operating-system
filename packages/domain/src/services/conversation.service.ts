@@ -3,9 +3,11 @@ import { PERMISSIONS } from "@ai-task-manager/shared";
 import type { CreateMessageInput, EditMessageInput } from "@ai-task-manager/shared";
 import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from "../errors";
 import { canAccessConversation as canAccessConversationImpl } from "../permission-engine/conversation-access";
+import { canAccessProject as canAccessProjectImpl } from "../permission-engine/project-access";
 import { AuditService } from "./audit.service";
 import { NotificationService, NotificationType } from "./notification.service";
 import { PermissionService } from "./permission.service";
+import { ProjectService, type ProjectDetail } from "./project.service";
 import { TaskAttachmentService, type AttachmentDTO } from "./task-attachment.service";
 import { TaskService, type TaskWithDetail } from "./task.service";
 
@@ -28,20 +30,27 @@ export interface FormattedReaction {
   users: Array<{ id: string; fullName: string }>;
 }
 
+/** What every conversation operation needs, regardless of whether it's the task-scoped or
+ * project-scoped conversation — resolved once by resolveTaskContext/resolveProjectContext. */
+type ConversationContext =
+  | { kind: "TASK"; task: TaskWithDetail; organizationId: string | null }
+  | { kind: "PROJECT"; project: ProjectDetail; organizationId: string | null };
+
 /**
- * Task Conversations — docs/architecture/15-task-conversation.md.
+ * Task & Project Conversations — docs/architecture/15-task-conversation.md (Phase 2A,
+ * task-only), generalized in Phase 2C (docs/architecture/17-phase2c-project-workspace-
+ * architecture-report.md §11) to also support one main conversation per project, reusing
+ * every model/method here rather than duplicating them — TaskMessage/mentions/reactions/
+ * read-state are completely unchanged; only the Conversation row itself gained an optional
+ * projectId alongside its existing optional taskId (exactly one of the two is ever set).
  *
- * Holds exactly one piece of authorization logic of its own — canAccessConversation below
- * — and even that is a composition of existing PermissionService/TaskService building
- * blocks, not a new primitive. Every method loads the task via
- * TaskService.getTaskRawByIdOrThrow (existence only) and then applies
- * canAccessConversation on top, rather than TaskService's own canViewTask, because
- * conversation access is deliberately narrower than task view access in exactly one case
- * (see canAccessConversation's doc comment). There is no separate membership table backing
- * this — see the schema comment on TaskConversation for why.
+ * Holds two pieces of authorization logic of its own — canAccessConversation (task) and,
+ * new in Phase 2C, project access via canAccessProject — both compositions of existing
+ * PermissionService/TaskService/ProjectService building blocks, never new primitives.
  */
 export class ConversationService {
   private readonly tasks: TaskService;
+  private readonly projects: ProjectService;
   private readonly permissions: PermissionService;
   private readonly audit: AuditService;
   private readonly notifications: NotificationService;
@@ -49,6 +58,7 @@ export class ConversationService {
 
   constructor(private readonly db: PrismaClient) {
     this.tasks = new TaskService(db);
+    this.projects = new ProjectService(db);
     this.permissions = new PermissionService(db);
     this.audit = new AuditService(db);
     this.notifications = new NotificationService(db);
@@ -65,16 +75,33 @@ export class ConversationService {
     return canAccessConversationImpl(this.permissions, userId, task);
   }
 
-  private async assertCanAccessConversation(userId: string, task: TaskWithDetail): Promise<void> {
-    if (!(await this.canAccessConversation(userId, task))) {
-      throw new ForbiddenError("You do not have access to this task's conversation");
+  private async resolveTaskContext(taskId: string): Promise<ConversationContext> {
+    const task = await this.tasks.getTaskRawByIdOrThrow(taskId);
+    return { kind: "TASK", task, organizationId: task.workspace.organizationId };
+  }
+
+  private async resolveProjectContext(projectId: string): Promise<ConversationContext> {
+    const project = await this.projects.getProjectRawByIdOrThrow(projectId);
+    return { kind: "PROJECT", project, organizationId: project.workspace.organizationId };
+  }
+
+  private async canAccessContext(userId: string, ctx: ConversationContext): Promise<boolean> {
+    return ctx.kind === "TASK"
+      ? canAccessConversationImpl(this.permissions, userId, ctx.task)
+      : canAccessProjectImpl(this.db, this.permissions, userId, ctx.project);
+  }
+
+  private async assertCanAccessContext(userId: string, ctx: ConversationContext): Promise<void> {
+    if (!(await this.canAccessContext(userId, ctx))) {
+      throw new ForbiddenError("You do not have access to this conversation");
     }
   }
 
-  /** Same bar as the pre-existing addComment (doc 04 task.comment) — reused, not reinvented. */
-  private async assertCanParticipate(actorId: string, task: TaskWithDetail): Promise<void> {
-    if (task.workspace.type === "ORGANIZATION") {
-      await this.permissions.assertHasAnyGrantWithPermission(actorId, task.workspace.organizationId!, PERMISSIONS.TASK_COMMENT);
+  /** Same bar as the pre-existing addComment (doc 04 task.comment) — reused, not
+   * reinvented, for both task and project conversations. */
+  private async assertCanParticipate(actorId: string, ctx: ConversationContext): Promise<void> {
+    if (ctx.organizationId) {
+      await this.permissions.assertHasAnyGrantWithPermission(actorId, ctx.organizationId, PERMISSIONS.TASK_COMMENT);
     }
   }
 
@@ -129,21 +156,21 @@ export class ConversationService {
     };
   }
 
-  private async getConversationOrThrow(taskId: string) {
-    const conversation = await this.db.taskConversation.findUnique({ where: { taskId } });
+  private async getConversationRowOrThrow(ctx: ConversationContext) {
+    const where = ctx.kind === "TASK" ? { taskId: ctx.task.id } : { projectId: ctx.project.id };
+    const conversation = await this.db.conversation.findUnique({ where: where as Prisma.ConversationWhereUniqueInput });
     if (!conversation) {
-      // Should not happen post-backfill (every task gets one transactionally on creation
-      // — see TaskService.createTask) — surfaced as 404 rather than silently created here,
-      // so a real gap is visible instead of masked.
-      throw new NotFoundError("This task has no conversation");
+      // Should not happen post-creation (every task/project gets one transactionally —
+      // see TaskService.createTask / ProjectService.createProject) — surfaced as 404
+      // rather than silently created here, so a real gap is visible instead of masked.
+      throw new NotFoundError("This conversation does not exist");
     }
     return conversation;
   }
 
-  async getConversationForTask(actorId: string, taskId: string) {
-    const task = await this.tasks.getTaskRawByIdOrThrow(taskId);
-    await this.assertCanAccessConversation(actorId, task);
-    const conversation = await this.getConversationOrThrow(taskId);
+  private async getConversationInfo(actorId: string, ctx: ConversationContext) {
+    await this.assertCanAccessContext(actorId, ctx);
+    const conversation = await this.getConversationRowOrThrow(ctx);
     const read = await this.db.taskConversationRead.findUnique({
       where: { conversationId_userId: { conversationId: conversation.id, userId: actorId } },
     });
@@ -156,13 +183,26 @@ export class ConversationService {
         createdAt: { gt: lastReadAt },
       },
     });
-    return { id: conversation.id, taskId, unreadCount, lastReadAt: read?.lastReadAt ?? null };
+    return {
+      id: conversation.id,
+      taskId: conversation.taskId,
+      projectId: conversation.projectId,
+      unreadCount,
+      lastReadAt: read?.lastReadAt ?? null,
+    };
   }
 
-  async listMessages(actorId: string, taskId: string, opts: { cursor?: string; limit?: number } = {}) {
-    const task = await this.tasks.getTaskRawByIdOrThrow(taskId);
-    await this.assertCanAccessConversation(actorId, task);
-    const conversation = await this.getConversationOrThrow(taskId);
+  async getConversationForTask(actorId: string, taskId: string) {
+    return this.getConversationInfo(actorId, await this.resolveTaskContext(taskId));
+  }
+
+  async getConversationForProject(actorId: string, projectId: string) {
+    return this.getConversationInfo(actorId, await this.resolveProjectContext(projectId));
+  }
+
+  private async listMessagesForContext(actorId: string, ctx: ConversationContext, opts: { cursor?: string; limit?: number } = {}) {
+    await this.assertCanAccessContext(actorId, ctx);
+    const conversation = await this.getConversationRowOrThrow(ctx);
     const limit = opts.limit ?? 30;
 
     const rows = await this.db.taskMessage.findMany({
@@ -181,11 +221,18 @@ export class ConversationService {
     return { items: page.reverse().map((m) => this.formatMessage(m, actorId)), nextCursor };
   }
 
-  async createMessage(actorId: string, taskId: string, input: CreateMessageInput) {
-    const task = await this.tasks.getTaskRawByIdOrThrow(taskId);
-    await this.assertCanAccessConversation(actorId, task);
-    await this.assertCanParticipate(actorId, task);
-    const conversation = await this.getConversationOrThrow(taskId);
+  async listMessages(actorId: string, taskId: string, opts: { cursor?: string; limit?: number } = {}) {
+    return this.listMessagesForContext(actorId, await this.resolveTaskContext(taskId), opts);
+  }
+
+  async listMessagesForProject(actorId: string, projectId: string, opts: { cursor?: string; limit?: number } = {}) {
+    return this.listMessagesForContext(actorId, await this.resolveProjectContext(projectId), opts);
+  }
+
+  private async createMessageInContext(actorId: string, ctx: ConversationContext, input: CreateMessageInput) {
+    await this.assertCanAccessContext(actorId, ctx);
+    await this.assertCanParticipate(actorId, ctx);
+    const conversation = await this.getConversationRowOrThrow(ctx);
 
     let parent: { id: string; senderId: string; conversationId: string } | null = null;
     if (input.parentMessageId) {
@@ -194,26 +241,33 @@ export class ConversationService {
         select: { id: true, senderId: true, conversationId: true },
       });
       if (!parent || parent.conversationId !== conversation.id) {
-        throw new ValidationError("parentMessageId does not belong to this task's conversation");
+        throw new ValidationError("parentMessageId does not belong to this conversation");
       }
     }
 
     // Never trust the client's mention list at face value — each mentioned user must
-    // independently satisfy the exact same CONVERSATION-access check as the poster (doc:
-    // "Do not allow arbitrary organization-wide user mentions if they do not have access").
+    // independently satisfy the exact same CONTEXT-access check as the poster (doc: "Do
+    // not allow arbitrary organization-wide user mentions if they do not have access").
     const mentionedUserIds = [...new Set(input.mentionedUserIds ?? [])].filter((id) => id !== actorId);
     for (const candidateId of mentionedUserIds) {
-      if (!(await this.canAccessConversation(candidateId, task))) {
+      if (!(await this.canAccessContext(candidateId, ctx))) {
         throw new ValidationError(`Cannot mention a user who does not have access to this task: ${candidateId}`);
       }
     }
 
     // Same treatment for attachments (doc 16): never trust the client's attachmentIds list
-    // — each must be this task's, this actor's own upload, and not already linked elsewhere.
+    // — each must belong to this exact task/project, this actor's own upload, and not
+    // already linked elsewhere.
     const attachmentIds = [...new Set(input.attachmentIds ?? [])];
     if (attachmentIds.length) {
-      await this.attachments.assertAttachmentsLinkable(actorId, taskId, attachmentIds);
+      if (ctx.kind === "TASK") {
+        await this.attachments.assertAttachmentsLinkable(actorId, ctx.task.id, attachmentIds);
+      } else {
+        await this.attachments.assertAttachmentsLinkableForProject(actorId, ctx.project.id, attachmentIds);
+      }
     }
+
+    const entityId = ctx.kind === "TASK" ? ctx.task.id : ctx.project.id;
 
     const created = await this.db.$transaction(async (tx) => {
       const message = await tx.taskMessage.create({
@@ -231,48 +285,72 @@ export class ConversationService {
       }
       if (attachmentIds.length) {
         await tx.taskAttachment.updateMany({
-          where: { id: { in: attachmentIds }, taskId, uploadedById: actorId, messageId: null },
+          where:
+            ctx.kind === "TASK"
+              ? { id: { in: attachmentIds }, taskId: entityId, uploadedById: actorId, messageId: null }
+              : { id: { in: attachmentIds }, projectId: entityId, uploadedById: actorId, messageId: null },
           data: { messageId: message.id },
         });
       }
       const txAudit = new AuditService(tx);
       await txAudit.log({
-        organizationId: task.workspace.organizationId,
+        organizationId: ctx.organizationId,
         actorId,
-        action: "task.message_added",
+        action: ctx.kind === "TASK" ? "task.message_added" : "project.message_added",
         entityType: "TaskMessage",
         entityId: message.id,
-        taskId,
+        taskId: ctx.kind === "TASK" ? entityId : undefined,
+        projectId: ctx.kind === "PROJECT" ? entityId : undefined,
         after: { parentMessageId: input.parentMessageId ?? null, mentionCount: mentionedUserIds.length, attachmentCount: attachmentIds.length },
       });
       return message;
     });
 
-    // Notify existing primary participants (creator + current individual assignee) plus,
-    // for a reply, the parent message's sender — same pattern as the pre-existing
-    // addComment notification, extended to also cover replies.
-    const notifyIds = new Set<string>([task.createdById]);
-    const current = task.assignments.find((a) => a.isCurrent);
-    if (current?.assigneeType === "USER" && current.assigneeUserId) notifyIds.add(current.assigneeUserId);
+    // Notify existing primary participants plus, for a reply, the parent message's sender
+    // — same pattern as the pre-existing addComment notification, extended to also cover
+    // replies and project conversations. For a task: creator + current individual
+    // assignee. For a project: its owner.
+    const notifyIds = new Set<string>();
+    // Preserves the pre-existing payload key convention every other notification in this
+    // codebase uses (`taskTitle` — see AssignmentService/TaskService), which
+    // notification-copy.ts's describeNotification reads by name; `projectTitle` is the
+    // equivalent for a project-scoped message, added alongside it (not replacing it).
+    const titleField: Record<string, string> =
+      ctx.kind === "TASK" ? { taskTitle: ctx.task.title } : { projectTitle: ctx.project.name };
+    if (ctx.kind === "TASK") {
+      notifyIds.add(ctx.task.createdById);
+      const current = ctx.task.assignments.find((a) => a.isCurrent);
+      if (current?.assigneeType === "USER" && current.assigneeUserId) notifyIds.add(current.assigneeUserId);
+    } else {
+      notifyIds.add(ctx.project.ownerId);
+    }
     if (parent) notifyIds.add(parent.senderId);
     notifyIds.delete(actorId);
     await this.notifications.notifyMany(
       [...notifyIds],
       NotificationType.MESSAGE_ADDED,
-      { taskId, taskTitle: task.title, messageId: created.id, senderId: actorId },
-      taskId
+      { taskId: ctx.kind === "TASK" ? entityId : undefined, projectId: ctx.kind === "PROJECT" ? entityId : undefined, ...titleField, messageId: created.id, senderId: actorId },
+      ctx.kind === "TASK" ? entityId : null
     );
 
     if (mentionedUserIds.length) {
       await this.notifications.notifyMany(
         mentionedUserIds,
         NotificationType.MENTIONED_IN_TASK,
-        { taskId, taskTitle: task.title, messageId: created.id, mentionedBy: actorId },
-        taskId
+        { taskId: ctx.kind === "TASK" ? entityId : undefined, projectId: ctx.kind === "PROJECT" ? entityId : undefined, ...titleField, messageId: created.id, mentionedBy: actorId },
+        ctx.kind === "TASK" ? entityId : null
       );
     }
 
     return this.getMessageByIdOrThrow(created.id, actorId);
+  }
+
+  async createMessage(actorId: string, taskId: string, input: CreateMessageInput) {
+    return this.createMessageInContext(actorId, await this.resolveTaskContext(taskId), input);
+  }
+
+  async createMessageForProject(actorId: string, projectId: string, input: CreateMessageInput) {
+    return this.createMessageInContext(actorId, await this.resolveProjectContext(projectId), input);
   }
 
   private async getMessageByIdOrThrow(messageId: string, viewerId: string) {
@@ -281,19 +359,21 @@ export class ConversationService {
     return this.formatMessage(raw, viewerId);
   }
 
-  private async loadMessageAndTask(actorId: string, messageId: string) {
+  private async loadMessageAndContext(actorId: string, messageId: string) {
     const message = await this.db.taskMessage.findUnique({
       where: { id: messageId },
       include: { conversation: true },
     });
     if (!message) throw new NotFoundError("Message not found");
-    const task = await this.tasks.getTaskRawByIdOrThrow(message.conversation.taskId);
-    await this.assertCanAccessConversation(actorId, task);
-    return { message, task };
+    const ctx = message.conversation.taskId
+      ? await this.resolveTaskContext(message.conversation.taskId)
+      : await this.resolveProjectContext(message.conversation.projectId!);
+    await this.assertCanAccessContext(actorId, ctx);
+    return { message, ctx };
   }
 
   async editMessage(actorId: string, messageId: string, input: EditMessageInput) {
-    const { message, task } = await this.loadMessageAndTask(actorId, messageId);
+    const { message, ctx } = await this.loadMessageAndContext(actorId, messageId);
     if (message.senderId !== actorId) throw new ForbiddenError("Only the sender can edit this message");
     if (message.isDeleted) throw new ConflictError("Cannot edit a deleted message");
 
@@ -302,18 +382,19 @@ export class ConversationService {
       data: { body: input.body, isEdited: true, editedAt: new Date() },
     });
     await this.audit.log({
-      organizationId: task.workspace.organizationId,
+      organizationId: ctx.organizationId,
       actorId,
-      action: "task.message_edited",
+      action: ctx.kind === "TASK" ? "task.message_edited" : "project.message_edited",
       entityType: "TaskMessage",
       entityId: messageId,
-      taskId: task.id,
+      taskId: ctx.kind === "TASK" ? ctx.task.id : undefined,
+      projectId: ctx.kind === "PROJECT" ? ctx.project.id : undefined,
     });
     return this.getMessageByIdOrThrow(messageId, actorId);
   }
 
   async deleteMessage(actorId: string, messageId: string): Promise<void> {
-    const { message, task } = await this.loadMessageAndTask(actorId, messageId);
+    const { message, ctx } = await this.loadMessageAndContext(actorId, messageId);
     if (message.senderId !== actorId) throw new ForbiddenError("Only the sender can delete this message");
     if (message.isDeleted) return;
 
@@ -322,18 +403,19 @@ export class ConversationService {
       data: { isDeleted: true, deletedAt: new Date() },
     });
     await this.audit.log({
-      organizationId: task.workspace.organizationId,
+      organizationId: ctx.organizationId,
       actorId,
-      action: "task.message_deleted",
+      action: ctx.kind === "TASK" ? "task.message_deleted" : "project.message_deleted",
       entityType: "TaskMessage",
       entityId: messageId,
-      taskId: task.id,
+      taskId: ctx.kind === "TASK" ? ctx.task.id : undefined,
+      projectId: ctx.kind === "PROJECT" ? ctx.project.id : undefined,
     });
   }
 
   async addReaction(actorId: string, messageId: string, emoji: string) {
-    const { message, task } = await this.loadMessageAndTask(actorId, messageId);
-    await this.assertCanParticipate(actorId, task);
+    const { message, ctx } = await this.loadMessageAndContext(actorId, messageId);
+    await this.assertCanParticipate(actorId, ctx);
     if (message.isDeleted) throw new ConflictError("Cannot react to a deleted message");
 
     await this.db.taskMessageReaction.upsert({
@@ -345,19 +427,26 @@ export class ConversationService {
   }
 
   async removeReaction(actorId: string, messageId: string, emoji: string) {
-    await this.loadMessageAndTask(actorId, messageId); // authorization only
+    await this.loadMessageAndContext(actorId, messageId); // authorization only
     await this.db.taskMessageReaction.deleteMany({ where: { messageId, userId: actorId, emoji } });
     return this.getMessageByIdOrThrow(messageId, actorId);
   }
 
-  async markRead(actorId: string, taskId: string): Promise<void> {
-    const task = await this.tasks.getTaskRawByIdOrThrow(taskId);
-    await this.assertCanAccessConversation(actorId, task);
-    const conversation = await this.getConversationOrThrow(taskId);
+  private async markReadInContext(actorId: string, ctx: ConversationContext): Promise<void> {
+    await this.assertCanAccessContext(actorId, ctx);
+    const conversation = await this.getConversationRowOrThrow(ctx);
     await this.db.taskConversationRead.upsert({
       where: { conversationId_userId: { conversationId: conversation.id, userId: actorId } },
       update: { lastReadAt: new Date() },
       create: { conversationId: conversation.id, userId: actorId, lastReadAt: new Date() },
     });
+  }
+
+  async markRead(actorId: string, taskId: string): Promise<void> {
+    return this.markReadInContext(actorId, await this.resolveTaskContext(taskId));
+  }
+
+  async markReadForProject(actorId: string, projectId: string): Promise<void> {
+    return this.markReadInContext(actorId, await this.resolveProjectContext(projectId));
   }
 }

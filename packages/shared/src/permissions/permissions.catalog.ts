@@ -16,6 +16,12 @@ export const PERMISSIONS = {
   WORKSPACE_CREATE: "workspace.create",
   PROJECT_CREATE: "project.create",
   PROJECT_MANAGE: "project.manage",
+  // Phase 2C — docs/architecture/17-phase2c-project-workspace-architecture-report.md §9.
+  // Namespaced `workspace_project.*` (not bare `project.*`) specifically to avoid
+  // colliding with PROJECT_CREATE/PROJECT_MANAGE above, which already cover creating/
+  // editing the Project row itself and are reused unchanged for that.
+  WORKSPACE_PROJECT_MANAGE_MEMBERS: "workspace_project.manage_members",
+  WORKSPACE_PROJECT_MANAGE_DATES: "workspace_project.manage_dates",
   TASK_CREATE: "task.create",
   TASK_ASSIGN: "task.assign",
   TASK_ASSIGN_CROSS_TEAM: "task.assign_cross_team",
@@ -51,6 +57,8 @@ export const PERMISSION_CATALOG: Array<{ key: PermissionKey; description: string
   { key: PERMISSIONS.WORKSPACE_CREATE, description: "Create a project workspace" },
   { key: PERMISSIONS.PROJECT_CREATE, description: "Create a project" },
   { key: PERMISSIONS.PROJECT_MANAGE, description: "Edit/delete a project" },
+  { key: PERMISSIONS.WORKSPACE_PROJECT_MANAGE_MEMBERS, description: "Add/remove a project's participants (individuals and teams)" },
+  { key: PERMISSIONS.WORKSPACE_PROJECT_MANAGE_DATES, description: "Create/edit/delete a project's important dates" },
   { key: PERMISSIONS.TASK_CREATE, description: "Create a task (personal or org)" },
   { key: PERMISSIONS.TASK_ASSIGN, description: "Assign a task within one's own team/scope" },
   { key: PERMISSIONS.TASK_ASSIGN_CROSS_TEAM, description: "Assign a task outside the assignor's own team" },
@@ -86,6 +94,8 @@ export const SYSTEM_ROLE_TEMPLATES: Record<string, PermissionKey[]> = {
     PERMISSIONS.WORKSPACE_CREATE,
     PERMISSIONS.PROJECT_CREATE,
     PERMISSIONS.PROJECT_MANAGE,
+    PERMISSIONS.WORKSPACE_PROJECT_MANAGE_MEMBERS,
+    PERMISSIONS.WORKSPACE_PROJECT_MANAGE_DATES,
     PERMISSIONS.TASK_CREATE,
     PERMISSIONS.TASK_ASSIGN,
     PERMISSIONS.TASK_ASSIGN_CROSS_TEAM,
@@ -108,6 +118,10 @@ export const SYSTEM_ROLE_TEMPLATES: Record<string, PermissionKey[]> = {
     PERMISSIONS.DEPARTMENT_MANAGE,
     PERMISSIONS.TEAM_CREATE,
     PERMISSIONS.TEAM_MANAGE,
+    PERMISSIONS.PROJECT_CREATE,
+    PERMISSIONS.PROJECT_MANAGE,
+    PERMISSIONS.WORKSPACE_PROJECT_MANAGE_MEMBERS,
+    PERMISSIONS.WORKSPACE_PROJECT_MANAGE_DATES,
     PERMISSIONS.TASK_CREATE,
     PERMISSIONS.TASK_ASSIGN,
     PERMISSIONS.TASK_ASSIGN_CROSS_TEAM,

@@ -912,4 +912,332 @@ describe("ABC College — full Phase 1 acceptance scenario (brief §32/33)", () 
       expect(unrelatedConvAccess.status).toBe(403);
     });
   });
+
+  // ── Phase 2C: Project / Event Workspace — brief §30, docs/architecture/17-phase2c- ──
+  // ── project-workspace-architecture-report.md §19 ──
+  // Extends the pre-existing Project model rather than a new "Workspace"-named entity
+  // (doc 17 §5). "Annual Day 2026", matching the brief's own example.
+
+  describe("Phase 2C: Project / Event Workspace", () => {
+    let projectId: string;
+    let projectAttachmentId: string;
+    let projectDateId: string;
+
+    it("1. Eldo creates the 'Annual Day 2026' event under Marketing Team — transactionally gets a main Conversation and is auto-listed as a ProjectMember", async () => {
+      const res = await eldo.client.post<{ id: string; kind: string; status: string }>(
+        `/api/v1/workspaces/${orgWorkspaceId}/projects`,
+        { name: "Annual Day 2026", kind: "EVENT", teamId: marketingTeamId }
+      );
+      expect(res.status, JSON.stringify(res)).toBe(200);
+      expect(res.data!.kind).toBe("EVENT");
+      expect(res.data!.status).toBe("ACTIVE");
+      projectId = res.data!.id;
+
+      const conv = await eldo.client.get<{ id: string; projectId: string | null }>(`/api/v1/projects/${projectId}/conversation`);
+      expect(conv.status, JSON.stringify(conv)).toBe(200);
+      expect(conv.data!.projectId).toBe(projectId);
+
+      const members = await eldo.client.get<Array<{ user: { id: string } }>>(`/api/v1/projects/${projectId}/members`);
+      expect(members.status, JSON.stringify(members)).toBe(200);
+      expect(members.data!.some((m) => m.user.id === eldo.id)).toBe(true);
+    });
+
+    it("2. a plain org member without PROJECT_CREATE cannot create a project", async () => {
+      const res = await priya.client.post(`/api/v1/workspaces/${orgWorkspaceId}/projects`, { name: "Priya's rogue project" });
+      expect(res.status).toBe(403);
+    });
+
+    it("3. listing /workspaces/:id/projects is filtered to the caller's own participation, not the whole workspace (doc 17 §2's fix)", async () => {
+      // Priya (Finance) has no relationship whatsoever to Annual Day 2026 yet.
+      const priyaList = await priya.client.get<Array<{ id: string }>>(`/api/v1/workspaces/${orgWorkspaceId}/projects`);
+      expect(priyaList.status, JSON.stringify(priyaList)).toBe(200);
+      expect(priyaList.data!.some((p) => p.id === projectId)).toBe(false);
+
+      const eldoList = await eldo.client.get<Array<{ id: string }>>(`/api/v1/workspaces/${orgWorkspaceId}/projects`);
+      expect(eldoList.data!.some((p) => p.id === projectId)).toBe(true);
+    });
+
+    it("4. a non-member, non-owner without REPORTS_VIEW cannot access the project directly (403, not 404)", async () => {
+      const res = await priya.client.get(`/api/v1/projects/${projectId}`);
+      expect(res.status).toBe(403);
+    });
+
+    it("5. adding an org member as a direct ProjectMember grants project access (view, conversation, files)", async () => {
+      const add = await eldo.client.post(`/api/v1/projects/${projectId}/members`, { userId: rahul.id });
+      expect(add.status, JSON.stringify(add)).toBe(200);
+
+      const rahulProject = await rahul.client.get(`/api/v1/projects/${projectId}`);
+      expect(rahulProject.status, JSON.stringify(rahulProject)).toBe(200);
+      const rahulConv = await rahul.client.get(`/api/v1/projects/${projectId}/conversation`);
+      expect(rahulConv.status).toBe(200);
+    });
+
+    it("6. adding a user who is not an org member is rejected", async () => {
+      const outsider = await signup("proj-outsider", "Project Outsider");
+      const res = await eldo.client.post(`/api/v1/projects/${projectId}/members`, { userId: outsider.id });
+      expect(res.status).toBe(400);
+    });
+
+    it("7. removing the project owner from its own member roster is rejected", async () => {
+      const res = await eldo.client.delete(`/api/v1/projects/${projectId}/members/${eldo.id}`);
+      expect(res.status).toBe(409);
+    });
+
+    it("8. a ProjectMember who is not the owner and has no PROJECT_MANAGE grant cannot manage the project (update, dates)", async () => {
+      const patch = await rahul.client.patch(`/api/v1/projects/${projectId}`, { name: "Hijacked name" });
+      expect(patch.status).toBe(403);
+      const addDate = await rahul.client.post(`/api/v1/projects/${projectId}/dates`, { title: "Sneaky date", date: "2026-01-01" });
+      expect(addDate.status).toBe(403);
+    });
+
+    it("9. adding a team to the project grants its plain members baseline access too (doc 17 §8's declarative decision) — Divya, a Marketing member with no direct ProjectMember row, gains it", async () => {
+      const addTeam = await eldo.client.post(`/api/v1/projects/${projectId}/teams`, { teamId: marketingTeamId });
+      expect(addTeam.status, JSON.stringify(addTeam)).toBe(200);
+
+      const divyaProject = await divya.client.get(`/api/v1/projects/${projectId}`);
+      expect(divyaProject.status, JSON.stringify(divyaProject)).toBe(200);
+      const divyaFiles = await divya.client.get(`/api/v1/projects/${projectId}/files`);
+      expect(divyaFiles.status).toBe(200);
+    });
+
+    it("10. REGRESSION (doc 17 §19's explicit required test) — project-team access does NOT leak into an unrelated task's conversation while it sits team-pending", async () => {
+      const freshTask = await eldo.client.post<{ id: string }>("/api/v1/tasks", {
+        workspaceId: orgWorkspaceId,
+        title: "Task unrelated to any project, team-pending",
+      });
+      const assign = await eldo.client.post(`/api/v1/tasks/${freshTask.data!.id}/assignments`, {
+        assigneeType: "TEAM",
+        assigneeTeamId: marketingTeamId,
+      });
+      expect(assign.status, JSON.stringify(assign)).toBe(200);
+
+      // Divya has project-level access via the Marketing Team's project participation
+      // (previous test) — but this task was never linked to any project and its team
+      // assignment is still PENDING_ACKNOWLEDGEMENT (no Team Head accept yet). Project
+      // access is strictly additive at the project layer and must never bypass the
+      // completely separate, unchanged task-level conversation-access rule (doc 17 §8/§10).
+      const divyaTaskConv = await divya.client.get(`/api/v1/tasks/${freshTask.data!.id}/conversation`);
+      expect(divyaTaskConv.status).toBe(403);
+    });
+
+    it("11. posting a project conversation message with a mention and an attachment works, same model as task conversations", async () => {
+      const uploaded = await rahul.client.uploadFiles<Array<{ id: string; fileName: string }>>(
+        `/api/v1/projects/${projectId}/files`,
+        [{ fileName: "banner-brief.txt", mimeType: "text/plain", data: Buffer.from("stage decoration brief") }]
+      );
+      expect(uploaded.status, JSON.stringify(uploaded)).toBe(200);
+      projectAttachmentId = uploaded.data![0]!.id;
+
+      const message = await rahul.client.post<{ attachments: Array<{ id: string }>; mentions: Array<{ id: string }> }>(
+        `/api/v1/projects/${projectId}/conversation/messages`,
+        { body: "Here's the stage decoration brief for review.", mentionedUserIds: [eldo.id], attachmentIds: [projectAttachmentId] }
+      );
+      expect(message.status, JSON.stringify(message)).toBe(200);
+      expect(message.data!.attachments).toHaveLength(1);
+      expect(message.data!.mentions.some((m) => m.id === eldo.id)).toBe(true);
+    });
+
+    it("12. unread count increments for other participants and mark-read clears it", async () => {
+      const before = await eldo.client.get<{ unreadCount: number }>(`/api/v1/projects/${projectId}/conversation`);
+      expect(before.data!.unreadCount).toBeGreaterThan(0);
+      await eldo.client.post(`/api/v1/projects/${projectId}/conversation/read`);
+      const after = await eldo.client.get<{ unreadCount: number }>(`/api/v1/projects/${projectId}/conversation`);
+      expect(after.data!.unreadCount).toBe(0);
+    });
+
+    it("13. Files: only the uploader can delete; retrieval reuses the existing /attachments/:id endpoint unchanged", async () => {
+      const get = await eldo.client.getRaw(`/api/v1/attachments/${projectAttachmentId}`);
+      expect(get.status, JSON.stringify(get)).toBe(200);
+      expect(get.body.toString()).toBe("stage decoration brief");
+
+      const eldoDelete = await eldo.client.delete(`/api/v1/attachments/${projectAttachmentId}`);
+      expect(eldoDelete.status).toBe(403);
+
+      const list = await eldo.client.get<Array<{ id: string }>>(`/api/v1/projects/${projectId}/files`);
+      expect(list.status, JSON.stringify(list)).toBe(200);
+      expect(list.data!.some((f) => f.id === projectAttachmentId)).toBe(true);
+    });
+
+    it("14. POST /projects/:id/tasks creates a task with projectId + the project's own workspaceId populated — thin filter, not a new task store", async () => {
+      const created = await eldo.client.post<{ id: string; projectId: string | null }>(`/api/v1/projects/${projectId}/tasks`, {
+        title: "Stage Decoration",
+        priority: "HIGH",
+      });
+      expect(created.status, JSON.stringify(created)).toBe(200);
+      expect(created.data!.projectId).toBe(projectId);
+
+      const list = await eldo.client.get<Array<{ id: string; title: string }>>(`/api/v1/projects/${projectId}/tasks`);
+      expect(list.status, JSON.stringify(list)).toBe(200);
+      expect(list.data!.some((t) => t.title === "Stage Decoration")).toBe(true);
+
+      // Same task must still show up in the ordinary global task list (My Tasks etc.) —
+      // a project is a contextual layer alongside the existing areas, never a replacement
+      // for them (doc 17 §17).
+      const globalList = await eldo.client.get<Array<{ id: string }>>(
+        `/api/v1/tasks?workspaceId=${orgWorkspaceId}&view=ALL`
+      );
+      expect(globalList.data!.some((t) => t.id === created.data!.id)).toBe(true);
+    });
+
+    it("15. a task created directly via POST /tasks with projectId set also appears under the project's task list — proving one shared store, not two", async () => {
+      const direct = await eldo.client.post<{ id: string }>("/api/v1/tasks", {
+        workspaceId: orgWorkspaceId,
+        projectId,
+        title: "Food Arrangement",
+      });
+      expect(direct.status, JSON.stringify(direct)).toBe(200);
+
+      const list = await eldo.client.get<Array<{ id: string; title: string }>>(`/api/v1/projects/${projectId}/tasks`);
+      expect(list.data!.some((t) => t.title === "Food Arrangement")).toBe(true);
+    });
+
+    it("16. progress is derived (never stored) from Task.status — completed/(completed+active), cancelled excluded from the denominator", async () => {
+      // Two tasks exist so far (Stage Decoration, Food Arrangement), both un-started.
+      const before = await eldo.client.get<{ total: number; completed: number; active: number; cancelled: number; percent: number }>(
+        `/api/v1/projects/${projectId}/progress`
+      );
+      expect(before.status, JSON.stringify(before)).toBe(200);
+      expect(before.data!.total).toBe(2);
+      expect(before.data!.percent).toBe(0);
+
+      const cancelMe = await eldo.client.post<{ id: string }>(`/api/v1/projects/${projectId}/tasks`, { title: "Scrapped idea" });
+      await eldo.client.delete(`/api/v1/tasks/${cancelMe.data!.id}`);
+
+      const after = await eldo.client.get<{ total: number; completed: number; active: number; cancelled: number; percent: number }>(
+        `/api/v1/projects/${projectId}/progress`
+      );
+      expect(after.status, JSON.stringify(after)).toBe(200);
+      expect(after.data!.cancelled).toBe(1);
+      // Denominator (total) excludes the cancelled task — still 2, not 3.
+      expect(after.data!.total).toBe(2);
+    });
+
+    it("17. Important Dates: add, list ordered by date, update, delete", async () => {
+      const d1 = await eldo.client.post<{ id: string }>(`/api/v1/projects/${projectId}/dates`, {
+        title: "Rehearsal",
+        date: "2026-11-20",
+      });
+      expect(d1.status, JSON.stringify(d1)).toBe(200);
+      const d2 = await eldo.client.post<{ id: string }>(`/api/v1/projects/${projectId}/dates`, {
+        title: "Event Day",
+        date: "2026-11-25",
+      });
+      projectDateId = d1.data!.id;
+
+      const list = await eldo.client.get<Array<{ id: string; title: string }>>(`/api/v1/projects/${projectId}/dates`);
+      expect(list.status, JSON.stringify(list)).toBe(200);
+      expect(list.data!.map((d) => d.title)).toEqual(["Rehearsal", "Event Day"]);
+
+      const update = await eldo.client.patch(`/api/v1/project-dates/${projectDateId}`, { title: "Dress Rehearsal" });
+      expect(update.status, JSON.stringify(update)).toBe(200);
+
+      const del = await eldo.client.delete(`/api/v1/project-dates/${d2.data!.id}`);
+      expect(del.status, JSON.stringify(del)).toBe(200);
+      const after = await eldo.client.get<Array<{ id: string; title: string }>>(`/api/v1/projects/${projectId}/dates`);
+      expect(after.data!.map((d) => d.title)).toEqual(["Dress Rehearsal"]);
+    });
+
+    it("18. Activity lists project-scoped audit entries only — creation, membership, dates, messages", async () => {
+      const res = await eldo.client.get<{ items: Array<{ action: string }> }>(`/api/v1/projects/${projectId}/activity?limit=100`);
+      expect(res.status, JSON.stringify(res)).toBe(200);
+      const actions = res.data!.items.map((e) => e.action);
+      expect(actions).toContain("project.created");
+      expect(actions).toContain("project.member_added");
+      expect(actions).toContain("project_date.created");
+      expect(actions).toContain("project.message_added");
+    });
+
+    it("18b. removing a member takes effect immediately (live lookup, no caching) — a task-level grant they separately hold is untouched (doc 17 §20)", async () => {
+      const add = await eldo.client.post(`/api/v1/projects/${projectId}/members`, { userId: priya.id });
+      expect(add.status, JSON.stringify(add)).toBe(200);
+      const before = await priya.client.get(`/api/v1/projects/${projectId}`);
+      expect(before.status, JSON.stringify(before)).toBe(200);
+
+      const remove = await eldo.client.delete(`/api/v1/projects/${projectId}/members/${priya.id}`);
+      expect(remove.status, JSON.stringify(remove)).toBe(200);
+      const after = await priya.client.get(`/api/v1/projects/${projectId}`);
+      expect(after.status).toBe(403);
+
+      // Priya's separate, task-level "current assignee" access (unrelated to this
+      // project) is untouched — task access has never been derived from project
+      // membership, so removing the latter has nothing to "reach into."
+      const taskForPriya = await eldo.client.post<{ id: string }>("/api/v1/tasks", {
+        workspaceId: orgWorkspaceId,
+        title: "Finance task, unrelated to the project",
+      });
+      const assign = await eldo.client.post(`/api/v1/tasks/${taskForPriya.data!.id}/assignments`, {
+        assigneeType: "USER",
+        assigneeUserId: priya.id,
+      });
+      expect(assign.status, JSON.stringify(assign)).toBe(200);
+      const priyaTaskAccess = await priya.client.get(`/api/v1/tasks/${taskForPriya.data!.id}`);
+      expect(priyaTaskAccess.status, JSON.stringify(priyaTaskAccess)).toBe(200);
+    });
+
+    it("19. PATCH updates the project; DELETE archives it (soft status transition, never a hard delete)", async () => {
+      const patch = await eldo.client.patch<{ description: string | null }>(`/api/v1/projects/${projectId}`, {
+        description: "College Annual Day celebration, Nov 2026.",
+      });
+      expect(patch.status, JSON.stringify(patch)).toBe(200);
+      expect(patch.data!.description).toBe("College Annual Day celebration, Nov 2026.");
+
+      const archive = await eldo.client.delete<{ status: string }>(`/api/v1/projects/${projectId}`);
+      expect(archive.status, JSON.stringify(archive)).toBe(200);
+      expect(archive.data!.status).toBe("ARCHIVED");
+
+      // Archived is a status transition, not a deletion — still readable.
+      const stillReadable = await eldo.client.get(`/api/v1/projects/${projectId}`);
+      expect(stillReadable.status).toBe(200);
+    });
+
+    it("20. cross-tenant access is denied across every project surface (project, files, conversation, activity, progress)", async () => {
+      const outsider = await signup("proj-tenant-outsider", "Project Tenant Outsider");
+      const checks = await Promise.all([
+        outsider.client.get(`/api/v1/projects/${projectId}`),
+        outsider.client.get(`/api/v1/projects/${projectId}/files`),
+        outsider.client.get(`/api/v1/projects/${projectId}/conversation`),
+        outsider.client.get(`/api/v1/projects/${projectId}/activity`),
+        outsider.client.get(`/api/v1/projects/${projectId}/progress`),
+      ]);
+      for (const res of checks) expect(res.status).toBe(403);
+    });
+
+    it("21. a project's conversation is distinct from any of its tasks' own conversations — a project message never appears in a task's message list or vice versa", async () => {
+      const task = await eldo.client.post<{ id: string }>(`/api/v1/projects/${projectId}/tasks`, { title: "Isolation check task" });
+      await eldo.client.post(`/api/v1/tasks/${task.data!.id}/conversation/messages`, { body: "Task-only message" });
+
+      const projectMessages = await eldo.client.get<{ items: Array<{ body: string | null }> }>(
+        `/api/v1/projects/${projectId}/conversation/messages?limit=50`
+      );
+      expect(projectMessages.data!.items.some((m) => m.body === "Task-only message")).toBe(false);
+
+      const taskMessages = await eldo.client.get<{ items: Array<{ body: string | null }> }>(
+        `/api/v1/tasks/${task.data!.id}/conversation/messages?limit=50`
+      );
+      expect(taskMessages.data!.items.some((m) => m.body === "Here's the stage decoration brief for review.")).toBe(false);
+    });
+
+    it("22. Personal workspace: a project works the same way, but has no participants beyond its owner", async () => {
+      const ws = await eldo.client.get<{ personal: { id: string } | null }>("/api/v1/workspaces");
+      const personalWorkspaceId = ws.data!.personal!.id;
+
+      const personal = await eldo.client.post<{ id: string; status: string }>(`/api/v1/workspaces/${personalWorkspaceId}/projects`, {
+        name: "My personal reading list",
+      });
+      expect(personal.status, JSON.stringify(personal)).toBe(200);
+
+      const addMember = await eldo.client.post(`/api/v1/projects/${personal.data!.id}/members`, { userId: rahul.id });
+      expect(addMember.status).toBe(403);
+      const addTeam = await eldo.client.post(`/api/v1/projects/${personal.data!.id}/teams`, { teamId: marketingTeamId });
+      expect(addTeam.status).toBe(403);
+
+      const rahulAccess = await rahul.client.get(`/api/v1/projects/${personal.data!.id}`);
+      expect(rahulAccess.status).toBe(403);
+    });
+
+    it("23. Phase 1/2A/2B behavior is unaffected by anything Phase 2C added", async () => {
+      const original = await eldo.client.get<{ status: string }>(`/api/v1/tasks/${taskId}`);
+      expect(original.data!.status).toBe("COMPLETED");
+    });
+  });
 });

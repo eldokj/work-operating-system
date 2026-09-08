@@ -7,3 +7,4 @@ export * from "./schemas/task.schema";
 export * from "./schemas/assignment.schema";
 export * from "./schemas/conversation.schema";
 export * from "./schemas/attachment.schema";
+export * from "./schemas/project.schema";

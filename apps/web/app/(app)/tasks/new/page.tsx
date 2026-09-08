@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useWorkspace } from "@/lib/workspace-context";
 import { api, ApiError } from "@/lib/api-client";
 
@@ -12,9 +12,14 @@ interface Team {
   id: string;
   name: string;
 }
+interface ProjectOption {
+  id: string;
+  name: string;
+}
 
 export default function NewTaskPage() {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const { currentWorkspaceId, currentOrg } = useWorkspace();
 
   const [title, setTitle] = useState("");
@@ -28,6 +33,12 @@ export default function NewTaskPage() {
   const [members, setMembers] = useState<Member[]>([]);
   const [teams, setTeams] = useState<Team[]>([]);
 
+  // Project/Event Workspace picker — doc 17 §17. Pre-selected when arriving via a
+  // project's "+ New task in this project" button (?projectId=...); otherwise optional,
+  // same as every other project-scoped field (Task.projectId has always been nullable).
+  const [projects, setProjects] = useState<ProjectOption[]>([]);
+  const [projectId, setProjectId] = useState(searchParams.get("projectId") ?? "");
+
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -36,6 +47,11 @@ export default function NewTaskPage() {
     api.get<Member[]>(`/api/v1/organizations/${currentOrg.organizationId}/members`).then(setMembers).catch(() => {});
     api.get<Team[]>(`/api/v1/organizations/${currentOrg.organizationId}/teams`).then(setTeams).catch(() => {});
   }, [currentOrg]);
+
+  useEffect(() => {
+    if (!currentWorkspaceId) return;
+    api.get<ProjectOption[]>(`/api/v1/workspaces/${currentWorkspaceId}/projects`).then(setProjects).catch(() => {});
+  }, [currentWorkspaceId]);
 
   function updateChecklistItem(i: number, value: string) {
     setChecklist((prev) => prev.map((c, idx) => (idx === i ? value : c)));
@@ -49,6 +65,7 @@ export default function NewTaskPage() {
     try {
       const task = await api.post<{ id: string }>("/api/v1/tasks", {
         workspaceId: currentWorkspaceId,
+        projectId: projectId || null,
         title: title.trim(),
         description: description.trim() || null,
         priority,
@@ -83,6 +100,20 @@ export default function NewTaskPage() {
             onChange={(e) => setDescription(e.target.value)}
           />
         </div>
+
+        {projects.length > 0 && (
+          <div>
+            <label className="label">Project / Event (optional)</label>
+            <select className="input" value={projectId} onChange={(e) => setProjectId(e.target.value)}>
+              <option value="">None</option>
+              {projects.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.name}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
 
         <div className="grid grid-cols-2 gap-4">
           <div>

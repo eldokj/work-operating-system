@@ -483,6 +483,17 @@ model Task {
   startDate                 DateTime?      @map("start_date") @db.Date
   dueDate                   DateTime?      @map("due_date")
   estimatedDurationMinutes  Int?           @map("estimated_duration_minutes")
+
+  // Phase 6 — docs/architecture/24-phase6-notifications-scheduler-architecture-report.md
+  // §8/§14. Idempotency markers for the scheduler's two deadline-based checks: NULL means
+  // "not yet notified for this condition." Set via a conditional UPDATE (...WHERE ... IS
+  // NULL) so a race between concurrent ticks produces at most one notification per task
+  // per condition, with no lock/queue required (see the doc's §8 correctness argument).
+  // Never cleared/reset once set — a task moving out of the approaching/overdue window
+  // (e.g. dueDate pushed out, or task completed) simply stops matching the tick's query;
+  // the marker itself is permanent history, not a live flag.
+  deadlineApproachingNotifiedAt DateTime? @map("deadline_approaching_notified_at")
+  overdueNotifiedAt             DateTime? @map("overdue_notified_at")
   createdById               String         @map("created_by")
   createdVia                TaskCreatedVia @default(DIRECT) @map("created_via")
 
@@ -530,6 +541,10 @@ model Task {
   @@index([projectId])
   @@index([status])
   @@index([originOrganizationId])
+  // Phase 6 — the scheduler tick's deadline-approaching/overdue query filters on dueDate
+  // every 15 minutes (doc 24 §10); indexed since it has no prior index and every tick
+  // scans through it.
+  @@index([dueDate])
   @@map("tasks")
 }
 

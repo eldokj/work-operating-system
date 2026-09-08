@@ -158,10 +158,31 @@ export class AssignmentService {
       });
 
       if (target.assigneeType === "USER") {
+        // Phase 6 — docs/architecture/24-phase6-notifications-scheduler-architecture-report.md
+        // §4.1. `previousCurrent` (computed above for the supersede logic) is also the
+        // exact signal that distinguishes a genuine reassignment from a first assignment
+        // — no extra query needed. A "reassignment" is: there was a prior current
+        // assignment, AND the new target is not simply re-notifying the same individual
+        // who already held it. `reassignInternal` (team → individual distribution) is a
+        // separate method and deliberately unaffected by this branch — that path is a
+        // first assignment from the receiving individual's own perspective.
+        const isReassignment =
+          !!previousCurrent &&
+          !(previousCurrent.assigneeType === "USER" && previousCurrent.assigneeUserId === target.assigneeUserId);
         await txNotify.notify(
           target.assigneeUserId!,
-          NotificationType.TASK_ASSIGNED,
-          { taskId, taskTitle: task.title, assignedBy: actorId },
+          isReassignment ? NotificationType.TASK_REASSIGNED : NotificationType.TASK_ASSIGNED,
+          {
+            taskId,
+            taskTitle: task.title,
+            assignedBy: actorId,
+            ...(isReassignment
+              ? {
+                  previousAssigneeId: previousCurrent!.assigneeUserId ?? null,
+                  previousAssigneeTeamId: previousCurrent!.assigneeTeamId ?? null,
+                }
+              : {}),
+          },
           taskId
         );
       } else {

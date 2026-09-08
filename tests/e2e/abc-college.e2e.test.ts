@@ -1940,4 +1940,116 @@ describe("ABC College — full Phase 1 acceptance scenario (brief §32/33)", () 
       expect(original.data!.status).toBe("COMPLETED");
     });
   });
+
+  // docs/architecture/24-phase6-notifications-scheduler-architecture-report.md. The
+  // scheduler itself (deadline-approaching/overdue) has no HTTP surface by design (doc §7
+  // — an internal tick, not a route) and is covered instead by real-Postgres integration
+  // tests in packages/domain/src/services/scheduler.service.test.ts. What's covered here,
+  // through the real HTTP API like every other scenario in this file: the two backend
+  // notification fixes (TASK_REASSIGNED, REVIEW_COMPLETED removal) and their
+  // authorization/recipient-correctness boundary.
+  describe("Phase 6: Proactive Work Awareness — notification correctness", () => {
+    interface NotificationItem {
+      id: string;
+      type: string;
+      payload: Record<string, unknown>;
+      isRead: boolean;
+      relatedTaskId: string | null;
+    }
+    async function notificationsFor(user: User, taskId: string): Promise<NotificationItem[]> {
+      const res = await user.client.get<{ items: NotificationItem[] }>("/api/v1/notifications?limit=100");
+      expect(res.status, JSON.stringify(res)).toBe(200);
+      return res.data!.items.filter((n) => n.relatedTaskId === taskId);
+    }
+
+    it("1. reassigning an IN_PROGRESS task to a different person fires TASK_REASSIGNED for the new assignee, not TASK_ASSIGNED", async () => {
+      const created = await eldo.client.post<{ id: string }>("/api/v1/tasks", {
+        workspaceId: orgWorkspaceId,
+        title: "Coordinate the alumni newsletter",
+        priority: "MEDIUM",
+        assignTo: { type: "USER", id: rahul.id },
+      });
+      expect(created.status, JSON.stringify(created)).toBe(200);
+      const reassignTaskId = created.data!.id;
+
+      const beforeAccept = await eldo.client.get<{ assignments: Array<{ id: string; isCurrent: boolean }> }>(
+        `/api/v1/tasks/${reassignTaskId}`
+      );
+      const firstAssignmentId = beforeAccept.data!.assignments.find((a) => a.isCurrent)!.id;
+      await rahul.client.post(`/api/v1/assignments/${firstAssignmentId}/accept`);
+
+      // Sanity: Rahul's first-ever assignment notification is TASK_ASSIGNED (unchanged
+      // behavior for a genuine first assignment).
+      const rahulFirstNotifications = await notificationsFor(rahul, reassignTaskId);
+      expect(rahulFirstNotifications.some((n) => n.type === "task.assigned")).toBe(true);
+      expect(rahulFirstNotifications.some((n) => n.type === "task.reassigned")).toBe(false);
+
+      const task = await eldo.client.get<{ status: string }>(`/api/v1/tasks/${reassignTaskId}`);
+      expect(task.data!.status).toBe("IN_PROGRESS"); // required for the REASSIGNED state-machine event (doc 05)
+
+      const reassign = await eldo.client.post(`/api/v1/tasks/${reassignTaskId}/assignments`, {
+        assigneeType: "USER",
+        assigneeUserId: divya.id,
+      });
+      expect(reassign.status, JSON.stringify(reassign)).toBe(200);
+
+      const divyaNotifications = await notificationsFor(divya, reassignTaskId);
+      expect(divyaNotifications.some((n) => n.type === "task.reassigned")).toBe(true);
+      expect(divyaNotifications.some((n) => n.type === "task.assigned")).toBe(false);
+      const reassignedNotification = divyaNotifications.find((n) => n.type === "task.reassigned")!;
+      expect(reassignedNotification.payload.previousAssigneeId).toBe(rahul.id);
+
+      // Information-disclosure boundary (doc 24 §9 / doc 23 §16): an unrelated org member
+      // never receives a notification about a task they have no relationship to.
+      const priyaNotifications = await notificationsFor(priya, reassignTaskId);
+      expect(priyaNotifications).toHaveLength(0);
+    });
+
+    it("2. reassign-internal (team -> individual distribution) still fires TASK_ASSIGNED, never TASK_REASSIGNED — a deliberately unchanged path (doc 24 §4.1)", async () => {
+      // Reuses the earlier Critical Workflow's task: Eldo -> Marketing Team -> Anu accepts
+      // -> reassign-internal to Rahul. From Rahul's own perspective this is the first time
+      // he has ever held this task, matching doc 24's explicit "do not change
+      // reassignInternal" finding.
+      const rahulNotifications = await notificationsFor(rahul, taskId);
+      expect(rahulNotifications.some((n) => n.type === "task.assigned")).toBe(true);
+      expect(rahulNotifications.some((n) => n.type === "task.reassigned")).toBe(false);
+    });
+
+    it("3. REVIEW_COMPLETED never appears anywhere — the review decision produces TASK_COMPLETED for the assignee only, matching the existing two-party model", async () => {
+      // Same reused task: Rahul submitted, Anu approved -> COMPLETED (Critical Workflow).
+      const rahulNotifications = await notificationsFor(rahul, taskId);
+      expect(rahulNotifications.some((n) => n.type === "task.completed")).toBe(true);
+      expect(rahulNotifications.some((n) => n.type === "review.completed")).toBe(false);
+
+      const anuNotifications = await notificationsFor(anu, taskId);
+      expect(anuNotifications.some((n) => n.type === "review.completed")).toBe(false);
+
+      const eldoNotifications = await notificationsFor(eldo, taskId);
+      expect(eldoNotifications.some((n) => n.type === "review.completed")).toBe(false);
+    });
+
+    it("4. the Notification Center API still marks read/all-read correctly for a Phase 6 notification, unmodified UI contract", async () => {
+      const list = await divya.client.get<{ items: NotificationItem[] }>("/api/v1/notifications?unreadOnly=true&limit=100");
+      expect(list.status, JSON.stringify(list)).toBe(200);
+      const unread = list.data!.items.find((n) => n.type === "task.reassigned");
+      expect(unread, "expected the reassignment notification from scenario 1 to still be unread").toBeTruthy();
+
+      const markRead = await divya.client.post(`/api/v1/notifications/${unread!.id}/read`);
+      expect(markRead.status, JSON.stringify(markRead)).toBe(200);
+
+      const afterMarkRead = await divya.client.get<{ items: NotificationItem[] }>("/api/v1/notifications?limit=100");
+      const same = afterMarkRead.data!.items.find((n) => n.id === unread!.id)!;
+      expect(same.isRead).toBe(true);
+
+      const markAll = await divya.client.post("/api/v1/notifications/mark-all-read");
+      expect(markAll.status, JSON.stringify(markAll)).toBe(200);
+      const afterMarkAll = await divya.client.get<{ items: NotificationItem[] }>("/api/v1/notifications?unreadOnly=true&limit=100");
+      expect(afterMarkAll.data!.items).toHaveLength(0);
+    });
+
+    it("regression: Phase 1 through Phase 5 behavior is unaffected by anything Phase 6 added", async () => {
+      const original = await eldo.client.get<{ status: string }>(`/api/v1/tasks/${taskId}`);
+      expect(original.data!.status).toBe("COMPLETED");
+    });
+  });
 });

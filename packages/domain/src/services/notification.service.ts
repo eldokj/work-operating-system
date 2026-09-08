@@ -13,7 +13,11 @@ export const NotificationType = {
   DEADLINE_APPROACHING: "deadline.approaching",
   TASK_OVERDUE: "task.overdue",
   REVIEW_REQUESTED: "review.requested",
-  REVIEW_COMPLETED: "review.completed",
+  // REVIEW_COMPLETED intentionally removed — Phase 6, doc 24 §4.2/§13. The review flow is
+  // a two-party exchange (submit → notifies the reviewer via REVIEW_REQUESTED; decision →
+  // notifies the assignee via TASK_COMPLETED/CHANGES_REQUESTED below) with no third party
+  // in the current authorization model to receive a distinct "review completed" signal —
+  // wiring it up would mean inventing a recipient rather than fixing a real gap.
   CHANGES_REQUESTED: "changes.requested",
   TASK_COMPLETED: "task.completed",
   // Phase 2A additions — docs/architecture/15-task-conversation.md.

@@ -24,8 +24,9 @@ export function describeNotification(type: string, payload: Record<string, unkno
       return `Overdue: "${title}"`;
     case "review.requested":
       return `Review requested: "${title}"`;
-    case "review.completed":
-      return `Review completed: "${title}"`;
+    // review.completed intentionally not handled — Phase 6, doc 24 §4.2. The type was
+    // removed (never wired to any trigger); the `default` case below covers any stray
+    // legacy row from before this change.
     case "changes.requested":
       return `Changes requested on "${title}"`;
     case "task.completed":

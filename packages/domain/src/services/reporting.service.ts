@@ -1,24 +1,21 @@
 import type { PrismaClient } from "@ai-task-manager/db";
 import { PERMISSIONS, type TaskListFilter } from "@ai-task-manager/shared";
 import { ForbiddenError, NotFoundError } from "../errors";
+import { localDayBounds } from "../local-day";
 import { isOverdue } from "../state-machines/task-status.machine";
 import { PermissionService } from "./permission.service";
 import { ProjectService } from "./project.service";
 import { TaskService, type TaskWithDetail } from "./task.service";
 
-function startOfDay(d: Date) {
-  const c = new Date(d);
-  c.setHours(0, 0, 0, 0);
-  return c;
-}
-function endOfDay(d: Date) {
-  const c = new Date(d);
-  c.setHours(23, 59, 59, 999);
-  return c;
-}
-
-function bucketByDueDate(tasks: TaskWithDetail[], now = new Date()) {
-  const today = { start: startOfDay(now), end: endOfDay(now) };
+// "Today" here now means the VIEWING USER's own local calendar day, not the server's
+// clock/zone — docs/architecture/19-phase3-daily-work-cycle-architecture-report.md §2/§31.
+// This was a real, pre-existing bug (this function previously used `d.setHours(...)`,
+// which reads the server process's own local timezone, not any particular user's) — fixed
+// here using the same `localDayBounds` utility Workday.workDate resolution uses (doc 19
+// §12), so the dashboard's "Due Today" and the Daily Work Cycle's "today" can never
+// disagree about what day it is for a given user.
+function bucketByDueDate(tasks: TaskWithDetail[], timezone: string, now = new Date()) {
+  const today = localDayBounds(now, timezone);
   const dueToday: TaskWithDetail[] = [];
   const upcoming: TaskWithDetail[] = [];
   const overdue: TaskWithDetail[] = [];
@@ -59,8 +56,11 @@ export class ReportingService {
   }
 
   async getPersonalDashboard(actorId: string, workspaceId: string) {
-    const myTasks = await this.tasks.listTasks(actorId, workspaceId, { view: "MY_TASKS" } as TaskListFilter);
-    const buckets = bucketByDueDate(myTasks);
+    const [myTasks, actor] = await Promise.all([
+      this.tasks.listTasks(actorId, workspaceId, { view: "MY_TASKS" } as TaskListFilter),
+      this.db.user.findUniqueOrThrow({ where: { id: actorId }, select: { defaultTimezone: true } }),
+    ]);
+    const buckets = bucketByDueDate(myTasks, actor.defaultTimezone);
 
     const workspace = await this.db.workspace.findUnique({ where: { id: workspaceId } });
     if (!workspace) throw new NotFoundError("Workspace not found");

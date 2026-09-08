@@ -90,6 +90,7 @@ function AppShell({ children }: { children: React.ReactNode }) {
         </div>
 
         <nav className="flex flex-1 flex-col gap-1">
+          {navLink("/today", "Today")}
           {navLink("/dashboard", "Dashboard")}
           {navLink("/tasks", "Tasks")}
           {navLink("/projects", "Projects")}

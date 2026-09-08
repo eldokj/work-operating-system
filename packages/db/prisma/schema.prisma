@@ -109,6 +109,20 @@ enum DependencyType {
   RELATES_TO
 }
 
+// Phase 3 — docs/architecture/19-phase3-daily-work-cycle-architecture-report.md §12/§22.
+// The daily-plan-local status of one DailyPlanItem — deliberately independent of
+// Task.status (doc 19 §10): a task can be Task.status=IN_PROGRESS while its
+// DailyPlanItem.status is still PLANNED (accepted long ago, not touched today) or
+// CARRIED_FORWARD (touched yesterday, not today).
+enum DailyPlanItemStatus {
+  PLANNED
+  IN_PROGRESS
+  COMPLETED_TODAY
+  CARRIED_FORWARD
+  MOVED_TO_BACKLOG
+  DROPPED_FOR_TODAY
+}
+
 enum ScopeType {
   ORGANIZATION
   DEPARTMENT
@@ -126,6 +140,11 @@ model User {
   avatarUrl        String?  @map("avatar_url")
   defaultTimezone  String   @default("UTC") @map("default_timezone")
   passwordHash     String   @map("password_hash") // Phase 1 local auth only — see doc 14
+  // Phase 3 — docs/architecture/19-phase3-daily-work-cycle-architecture-report.md §12/§16.
+  // Optional per-weekday {start,end} in "HH:mm"; null means "use the system default
+  // (Mon-Fri 09:00-17:00)" applied in application code. Advisory input to capacity math
+  // only — never an enforcement boundary on when a user may act (doc 19 §16/§22).
+  workingHours     Json?    @map("working_hours")
   createdAt        DateTime @default(now()) @map("created_at")
 
   organizationMemberships OrganizationMember[]
@@ -158,6 +177,7 @@ model User {
   projectMembersAdded     ProjectMember[]         @relation("ProjectMemberAddedBy")
   projectTeamsAdded       ProjectTeam[]
   projectDatesCreated     ProjectDate[]
+  workdays                Workday[]
 
   @@map("users")
 }
@@ -500,6 +520,11 @@ model Task {
   // by the unique constraint on Conversation.taskId (widened for Phase 2C — doc 17 §6.4).
   conversation      Conversation?
   auditLogs         AuditLog[]          @relation("AuditLogTask")
+  // Phase 3 — docs/architecture/19-phase3-daily-work-cycle-architecture-report.md §13.
+  // A task may appear on any number of daily plan entries across different days (never
+  // more than one per single day — enforced by DailyPlanItem's own unique constraint) —
+  // this Task row is always the source of truth; DailyPlanItem only ever references it.
+  dailyPlanItems    DailyPlanItem[]
 
   @@index([workspaceId])
   @@index([projectId])
@@ -732,16 +757,23 @@ model AuditLog {
   // this same table, never a parallel one.
   projectId String? @map("project_id")
 
+  // Phase 3 addition — docs/architecture/19-phase3-daily-work-cycle-architecture-report.md
+  // §12/§20. Fourth use of the same additive-nullable-column pattern: a day's full
+  // activity history becomes one indexed query over this same table, never a parallel one.
+  workdayId String? @map("workday_id")
+
   organization Organization? @relation(fields: [organizationId], references: [id])
   actor        User          @relation(fields: [actorId], references: [id])
   task         Task?         @relation("AuditLogTask", fields: [taskId], references: [id])
   project      Project?      @relation("AuditLogProject", fields: [projectId], references: [id], onDelete: SetNull)
+  workday      Workday?      @relation(fields: [workdayId], references: [id], onDelete: SetNull)
 
   @@index([organizationId])
   @@index([entityType, entityId])
   @@index([actorId])
   @@index([taskId, createdAt])
   @@index([projectId, createdAt])
+  @@index([workdayId, createdAt])
   @@map("audit_logs")
 }
 
@@ -876,4 +908,111 @@ model TaskConversationRead {
 
   @@id([conversationId, userId])
   @@map("task_conversation_reads")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Phase 3 — Daily Work Cycle (docs/architecture/19-phase3-daily-work-cycle-architecture-report.md)
+//
+// A thin, personal, reference-only layer over the existing work graph — never a second
+// task system. Task/TaskAssignment/the task lifecycle are completely unchanged by
+// anything below; DailyPlanItem always references an existing Task by id, never copies
+// any of its fields (doc 19 §13). Daily planning is personal by default and, in Phase 3,
+// exclusively so: every consumer of these tables only ever operates on the calling
+// user's own rows (doc 19 §27) — there is deliberately no "plan for someone else"
+// capability yet.
+// ─────────────────────────────────────────────────────────────────────────
+
+// One row per (user, local calendar day) — an anchor for that day's start/close, not a
+// container that must have any DailyPlanItems to exist meaningfully (doc 19 §11). Status
+// (NOT_STARTED / OPEN / CLOSED) is deliberately NOT a stored column — it's derived from
+// startedAt/closedAt alone (doc 19 §22), so it can never drift from the data it describes.
+model Workday {
+  id             String    @id @default(uuid())
+  userId         String    @map("user_id")
+  // The user's LOCAL calendar date (no time component) — computed server-side from
+  // User.defaultTimezone at write time, never from raw server `now()` alone (doc 19 §12,
+  // §31 — this is the fix for the pre-existing timezone bug in ReportingService's
+  // bucketByDueDate). @db.Date keeps this unambiguous: a plain date, not an instant.
+  workDate       DateTime  @db.Date @map("work_date")
+  // Set once, lazily, on first engagement with that day — "starting the day" is an
+  // implicit side effect of touching any Phase 3 endpoint that date, not a button the
+  // user must remember to press first (doc 19 §5/§22).
+  startedAt      DateTime? @map("started_at")
+  // Set once, only by a successful, fully-validated Close (doc 19 §8) — every
+  // non-terminal DailyPlanItem for this day must have an explicit disposition first.
+  closedAt       DateTime? @map("closed_at")
+  reflectionNote String?   @map("reflection_note")
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  user      User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items     DailyPlanItem[]
+  auditLogs AuditLog[]
+
+  // Exactly one Workday per user per local day — also serves as the natural lookup index,
+  // so no separate @@index is needed (doc 19 §12).
+  @@unique([userId, workDate])
+  @@map("workdays")
+}
+
+// "This task is on my plan for this specific day," plus its local status/timing — the
+// one genuine decision this whole model exists to record (doc 19 §11). Every other
+// concept the brief considered (PlannedTask, TimeBlock, WorkSession, UnplannedWork,
+// CarryForward, DailyReview) folds into fields on this one table rather than becoming a
+// separate entity — see doc 19 §11 for the per-concept justification.
+model DailyPlanItem {
+  id        String              @id @default(uuid())
+  workdayId String              @map("workday_id")
+  taskId    String              @map("task_id")
+  status    DailyPlanItemStatus @default(PLANNED)
+  // App-assigned ordering within the day (drag-and-drop is a UI concern over this same
+  // field, not a new data need — doc 19 §6).
+  position  Int                 @default(0)
+  // User-declared, never clock-inferred (doc 19 §18): true only when the user explicitly
+  // marks an item as "wasn't part of my original plan," not derived from when it was added.
+  isUnplanned Boolean           @default(false) @map("is_unplanned")
+  // The day-specific estimate — deliberately separate from Task.estimatedDurationMinutes
+  // (doc 19 §13): the task's own field is a general, set-once default; this is "what I
+  // actually expect to spend on it today," which may legitimately differ.
+  plannedDurationMinutes Int?   @map("planned_duration_minutes")
+  // Optional "I intend to do this from X to Y today" — no conflict-detection, no
+  // calendar-grid UI; just a hook a future Calendar phase can plot against with zero
+  // schema change (doc 19 §16/§23).
+  scheduledStart DateTime?      @map("scheduled_start")
+  scheduledEnd   DateTime?      @map("scheduled_end")
+  // First "Start" press / "Complete" press — one coarse actual-elapsed-time signal,
+  // deliberately without WorkSession-style pause/resume history (doc 19 §17). Never
+  // caller-supplied; always set to the server's `now()` by the transition endpoints that
+  // own them (doc 19 §28 — prevents falsified time entries).
+  startedAt   DateTime?         @map("started_at")
+  completedAt DateTime?         @map("completed_at")
+  // Carry-forward chain — a status transition plus a link, not a new entity (doc 19 §19).
+  // Points at the prior day's item this one continues from. The reverse direction ("what
+  // was I carried to") is a simple reverse lookup (findFirst where carriedFromItemId =
+  // this.id) rather than a second stored/related FK column — at most one successor is
+  // ever created per source (its own status flips to the terminal CARRIED_FORWARD exactly
+  // once when that happens), so a single-column, single-relation self-link is sufficient
+  // to preserve full bidirectional history without the added complexity of a dual-FK
+  // self-relation on one model (a deliberate simplification over doc 19 §12's two-column
+  // sketch — identical guarantees, fewer moving parts).
+  carriedFromItemId String?          @map("carried_from_item_id")
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+
+  workday        Workday         @relation(fields: [workdayId], references: [id], onDelete: Cascade)
+  // Tasks are never hard-deleted in this codebase (only cancelled — doc 05) — this
+  // cascade is a structural safety net for an unreachable case today, not an active path,
+  // matching the same reasoning already used for Workspace's owner cascade.
+  task              Task            @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  carriedFromItem   DailyPlanItem?  @relation("CarryForwardChain", fields: [carriedFromItemId], references: [id], onDelete: SetNull)
+  carriedForwardTo  DailyPlanItem[] @relation("CarryForwardChain")
+
+  // A task can appear AT MOST ONCE per specific day's plan (prevents duplicate planning
+  // the same day) while remaining fully plannable again on a DIFFERENT day, since
+  // workdayId differs — doc 19 §12/§13's exact requirement, enforced at the DB level as a
+  // second layer of defense beyond the application check (doc 19 §27).
+  @@unique([workdayId, taskId])
+  @@index([workdayId, position])
+  @@index([taskId])
+  @@index([carriedFromItemId])
+  @@map("daily_plan_items")
 }

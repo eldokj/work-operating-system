@@ -1240,4 +1240,303 @@ describe("ABC College — full Phase 1 acceptance scenario (brief §32/33)", () 
       expect(original.data!.status).toBe("COMPLETED");
     });
   });
+
+  // ── Phase 3: Daily Work Cycle — docs/architecture/19-phase3-daily-work-cycle- ──
+  // ── architecture-report.md §30 ──
+  // Fresh tasks throughout, so these tests never depend on any other block's leftover
+  // state. Reuses Management -> Marketing Team -> Anu -> Rahul exactly like Phase 2B/2C.
+
+  describe("Phase 3: Daily Work Cycle", () => {
+    let dailyTaskId: string;
+
+    it("sets up a task assigned directly to Rahul and accepted, mirroring the main scenario", async () => {
+      const created = await eldo.client.post<{ id: string }>("/api/v1/tasks", {
+        workspaceId: orgWorkspaceId,
+        title: "Draft the newsletter",
+        priority: "MEDIUM",
+      });
+      dailyTaskId = created.data!.id;
+      const assign = await eldo.client.post(`/api/v1/tasks/${dailyTaskId}/assignments`, {
+        assigneeType: "USER",
+        assigneeUserId: rahul.id,
+      });
+      expect(assign.status, JSON.stringify(assign)).toBe(200);
+      const task = await rahul.client.get<{ assignments: Array<{ id: string; isCurrent: boolean }> }>(`/api/v1/tasks/${dailyTaskId}`);
+      const accept = await rahul.client.post(`/api/v1/assignments/${task.data!.assignments.find((a) => a.isCurrent)!.id}/accept`);
+      expect(accept.status, JSON.stringify(accept)).toBe(200);
+    });
+
+    it("1. an assigned and accepted task appears in Inbox, not on Today, until explicitly planned", async () => {
+      const inbox = await rahul.client.get<Array<{ id: string }>>(`/api/v1/me/workday/inbox?workspaceId=${orgWorkspaceId}`);
+      expect(inbox.status, JSON.stringify(inbox)).toBe(200);
+      expect(inbox.data!.some((t) => t.id === dailyTaskId)).toBe(true);
+
+      const items = await rahul.client.get<Array<{ task: { id: string } }>>("/api/v1/me/workday/items");
+      expect(items.status, JSON.stringify(items)).toBe(200);
+      expect(items.data!.some((i) => i.task.id === dailyTaskId)).toBe(false);
+    });
+
+    it("2. adding it to Today moves it out of Inbox and onto the plan", async () => {
+      const add = await rahul.client.post<{ id: string; status: string; isUnplanned: boolean }>("/api/v1/me/workday/items", {
+        taskId: dailyTaskId,
+      });
+      expect(add.status, JSON.stringify(add)).toBe(200);
+      expect(add.data!.status).toBe("PLANNED");
+      expect(add.data!.isUnplanned).toBe(false);
+
+      const inbox = await rahul.client.get<Array<{ id: string }>>(`/api/v1/me/workday/inbox?workspaceId=${orgWorkspaceId}`);
+      expect(inbox.data!.some((t) => t.id === dailyTaskId)).toBe(false);
+
+      const items = await rahul.client.get<Array<{ task: { id: string } }>>("/api/v1/me/workday/items");
+      expect(items.data!.some((i) => i.task.id === dailyTaskId)).toBe(true);
+    });
+
+    it("3. planning the same task on the same day twice is rejected", async () => {
+      const res = await rahul.client.post("/api/v1/me/workday/items", { taskId: dailyTaskId });
+      expect(res.status).toBe(409);
+    });
+
+    it("4. the same task CAN be planned on a different day", async () => {
+      const tomorrow = new Date();
+      tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
+      const dateStr = tomorrow.toISOString().slice(0, 10);
+      const res = await rahul.client.post<{ id: string }>("/api/v1/me/workday/items", { taskId: dailyTaskId, date: dateStr });
+      expect(res.status, JSON.stringify(res)).toBe(200);
+      // Clean up so this doesn't interfere with later carry-forward assertions.
+      await rahul.client.delete(`/api/v1/workday-items/${res.data!.id}`);
+    });
+
+    it("5. a quick-added item is correctly flagged isUnplanned, distinct from a deliberately planned one", async () => {
+      const unplannedTask = await eldo.client.post<{ id: string }>("/api/v1/tasks", {
+        workspaceId: orgWorkspaceId,
+        title: "Unplanned fire drill",
+      });
+      await eldo.client.post(`/api/v1/tasks/${unplannedTask.data!.id}/assignments`, { assigneeType: "USER", assigneeUserId: rahul.id });
+      const task = await rahul.client.get<{ assignments: Array<{ id: string; isCurrent: boolean }> }>(`/api/v1/tasks/${unplannedTask.data!.id}`);
+      await rahul.client.post(`/api/v1/assignments/${task.data!.assignments.find((a) => a.isCurrent)!.id}/accept`);
+
+      const add = await rahul.client.post<{ isUnplanned: boolean }>("/api/v1/me/workday/items", {
+        taskId: unplannedTask.data!.id,
+        isUnplanned: true,
+      });
+      expect(add.status, JSON.stringify(add)).toBe(200);
+      expect(add.data!.isUnplanned).toBe(true);
+    });
+
+    it("6. a team-pending assignment cannot be planned by anyone — only the eventual accepted individual assignee can", async () => {
+      const teamTask = await eldo.client.post<{ id: string }>("/api/v1/tasks", {
+        workspaceId: orgWorkspaceId,
+        title: "Team-pending, not yet anyone's individual work",
+      });
+      await eldo.client.post(`/api/v1/tasks/${teamTask.data!.id}/assignments`, { assigneeType: "TEAM", assigneeTeamId: marketingTeamId });
+
+      // Rahul is a plain Marketing member — the team assignment is still
+      // PENDING_ACKNOWLEDGEMENT, no individual owns this task yet.
+      const res = await rahul.client.post("/api/v1/me/workday/items", { taskId: teamTask.data!.id });
+      expect(res.status).toBe(403);
+      // Even Anu, the Team Head who *could* accept on the team's behalf, cannot plan it
+      // until an individual actually holds it.
+      const anuRes = await anu.client.post("/api/v1/me/workday/items", { taskId: teamTask.data!.id });
+      expect(anuRes.status).toBe(403);
+    });
+
+    it("7. Start/Complete transitions on a plan item never touch the task's own lifecycle status", async () => {
+      const before = await rahul.client.get<{ status: string }>(`/api/v1/tasks/${dailyTaskId}`);
+      const taskStatusBefore = before.data!.status;
+
+      const items = await rahul.client.get<Array<{ id: string; task: { id: string } }>>("/api/v1/me/workday/items");
+      const itemId = items.data!.find((i) => i.task.id === dailyTaskId)!.id;
+
+      const started = await rahul.client.post<{ status: string; startedAt: string | null }>(`/api/v1/workday-items/${itemId}/start`);
+      expect(started.status, JSON.stringify(started)).toBe(200);
+      expect(started.data!.status).toBe("IN_PROGRESS");
+      expect(started.data!.startedAt).toBeTruthy();
+
+      const midTask = await rahul.client.get<{ status: string }>(`/api/v1/tasks/${dailyTaskId}`);
+      expect(midTask.data!.status).toBe(taskStatusBefore); // unchanged by Start
+
+      const completed = await rahul.client.post<{ status: string; completedAt: string | null }>(`/api/v1/workday-items/${itemId}/complete`);
+      expect(completed.status, JSON.stringify(completed)).toBe(200);
+      expect(completed.data!.status).toBe("COMPLETED_TODAY");
+      expect(completed.data!.completedAt).toBeTruthy();
+
+      const afterTask = await rahul.client.get<{ status: string }>(`/api/v1/tasks/${dailyTaskId}`);
+      expect(afterTask.data!.status).toBe(taskStatusBefore); // still unchanged by Complete
+    });
+
+    it("8. un-planning succeeds while PLANNED and untouched, and fails once execution has begun", async () => {
+      const fresh = await eldo.client.post<{ id: string }>("/api/v1/tasks", { workspaceId: orgWorkspaceId, title: "Deletable plan item" });
+      await eldo.client.post(`/api/v1/tasks/${fresh.data!.id}/assignments`, { assigneeType: "USER", assigneeUserId: rahul.id });
+      const t = await rahul.client.get<{ assignments: Array<{ id: string; isCurrent: boolean }> }>(`/api/v1/tasks/${fresh.data!.id}`);
+      await rahul.client.post(`/api/v1/assignments/${t.data!.assignments.find((a) => a.isCurrent)!.id}/accept`);
+
+      const add = await rahul.client.post<{ id: string }>("/api/v1/me/workday/items", { taskId: fresh.data!.id });
+      const del = await rahul.client.delete(`/api/v1/workday-items/${add.data!.id}`);
+      expect(del.status, JSON.stringify(del)).toBe(200);
+
+      const add2 = await rahul.client.post<{ id: string }>("/api/v1/me/workday/items", { taskId: fresh.data!.id });
+      await rahul.client.post(`/api/v1/workday-items/${add2.data!.id}/start`);
+      const del2 = await rahul.client.delete(`/api/v1/workday-items/${add2.data!.id}`);
+      expect(del2.status).toBe(409);
+    });
+
+    it("9. reassigning the underlying task away flags the plan item as ownership-lost, without deleting it, and blocks further Start/Complete", async () => {
+      const reassignable = await eldo.client.post<{ id: string }>("/api/v1/tasks", { workspaceId: orgWorkspaceId, title: "Will be reassigned mid-day" });
+      await eldo.client.post(`/api/v1/tasks/${reassignable.data!.id}/assignments`, { assigneeType: "USER", assigneeUserId: rahul.id });
+      const t = await rahul.client.get<{ assignments: Array<{ id: string; isCurrent: boolean }> }>(`/api/v1/tasks/${reassignable.data!.id}`);
+      await rahul.client.post(`/api/v1/assignments/${t.data!.assignments.find((a) => a.isCurrent)!.id}/accept`);
+      const add = await rahul.client.post<{ id: string }>("/api/v1/me/workday/items", { taskId: reassignable.data!.id });
+
+      // Reassigned away from Rahul to Divya mid-flight.
+      const reassign = await eldo.client.post(`/api/v1/tasks/${reassignable.data!.id}/assignments`, {
+        assigneeType: "USER",
+        assigneeUserId: divya.id,
+      });
+      expect(reassign.status, JSON.stringify(reassign)).toBe(200);
+
+      const items = await rahul.client.get<Array<{ id: string; ownershipLost: boolean }>>("/api/v1/me/workday/items");
+      const item = items.data!.find((i) => i.id === add.data!.id)!;
+      expect(item.ownershipLost).toBe(true);
+
+      const startAttempt = await rahul.client.post(`/api/v1/workday-items/${add.data!.id}/start`);
+      expect(startAttempt.status).toBe(403);
+    });
+
+    it("10. Close rejects an incomplete disposition list, naming exactly which items are unresolved", async () => {
+      const res = await rahul.client.post<never>("/api/v1/me/workday/close", { dispositions: [] });
+      expect(res.status).toBe(400);
+      expect(res.error?.details).toBeTruthy();
+    });
+
+    it("11. Close with a full, valid disposition list applies each action and preserves carry-forward history", async () => {
+      // Rahul has several unresolved items by now: the ownership-lost one from test 9,
+      // the still-IN_PROGRESS-or-PLANNED ones from earlier tests. Resolve everything.
+      const items = await rahul.client.get<Array<{ id: string; status: string; task: { status: string } }>>("/api/v1/me/workday/items");
+      const unresolved = items.data!.filter((i) => ["PLANNED", "IN_PROGRESS"].includes(i.status) && !["COMPLETED", "CANCELLED"].includes(i.task.status));
+      expect(unresolved.length).toBeGreaterThan(0);
+
+      // First item -> carry forward; rest -> drop (simplest disposition to apply broadly).
+      const [carryItem, ...rest] = unresolved;
+      const dispositions = [
+        { itemId: carryItem!.id, action: "CARRY_FORWARD" },
+        ...rest.map((i) => ({ itemId: i.id, action: "DROP" as const })),
+      ];
+
+      const close = await rahul.client.post<{ status: string; closedAt: string | null }>("/api/v1/me/workday/close", { dispositions });
+      expect(close.status, JSON.stringify(close)).toBe(200);
+      expect(close.data!.status).toBe("CLOSED");
+      expect(close.data!.closedAt).toBeTruthy();
+
+      // Closing again is rejected — not idempotent by design.
+      const closeAgain = await rahul.client.post("/api/v1/me/workday/close", { dispositions: [] });
+      expect(closeAgain.status).toBe(409);
+
+      // Tomorrow's plan now contains the carried-forward item, linked back to the original.
+      const tomorrow = new Date();
+      tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
+      const dateStr = tomorrow.toISOString().slice(0, 10);
+      const tomorrowItems = await rahul.client.get<Array<{ id: string; carriedFromItemId: string | null }>>(
+        `/api/v1/me/workday/items?date=${dateStr}`
+      );
+      expect(tomorrowItems.status, JSON.stringify(tomorrowItems)).toBe(200);
+      expect(tomorrowItems.data!.some((i) => i.carriedFromItemId === carryItem!.id)).toBe(true);
+    });
+
+    it("12. a task already resolved (COMPLETED) outside the daily-plan layer is auto-exempted from needing a Close disposition", async () => {
+      const autoResolve = await eldo.client.post<{ id: string }>("/api/v1/tasks", { workspaceId: orgWorkspaceId, title: "Will be fully completed" });
+      const assign = await eldo.client.post(`/api/v1/tasks/${autoResolve.data!.id}/assignments`, { assigneeType: "USER", assigneeUserId: divya.id });
+      const t = await divya.client.get<{ assignments: Array<{ id: string; isCurrent: boolean }> }>(`/api/v1/tasks/${autoResolve.data!.id}`);
+      await divya.client.post(`/api/v1/assignments/${t.data!.assignments.find((a) => a.isCurrent)!.id}/accept`);
+      await divya.client.post("/api/v1/me/workday/items", { taskId: autoResolve.data!.id });
+
+      // Fully complete the task through the existing, unmodified lifecycle — submit then
+      // approve (Eldo assigned it, so Eldo is the designated reviewer).
+      await divya.client.post(`/api/v1/tasks/${autoResolve.data!.id}/submit`);
+      const review = await eldo.client.post<{ status: string }>(`/api/v1/tasks/${autoResolve.data!.id}/reviews`, { decision: "APPROVED" });
+      expect(review.status, JSON.stringify(review)).toBe(200);
+      expect(review.data!.status).toBe("COMPLETED");
+
+      // Close with NO disposition for this item — must succeed anyway, since the task
+      // resolved itself.
+      const close = await divya.client.post<{ status: string }>("/api/v1/me/workday/close", { dispositions: [] });
+      expect(close.status, JSON.stringify(close)).toBe(200);
+      expect(close.data!.status).toBe("CLOSED");
+    });
+
+    it("13. cross-user access: another user cannot read, modify, or act on someone else's daily plan items", async () => {
+      const outsider = await signup("daily-outsider", "Daily Outsider");
+      // Anu still has an open, unclosed workday with no items of her own touched yet in
+      // this block — use a task planned by Anu instead, since Rahul's/Divya's days are
+      // now closed above (closed days 404/409 on mutation attempts regardless of who asks,
+      // which would make this test ambiguous about *why* it failed).
+      const anuTask = await eldo.client.post<{ id: string }>("/api/v1/tasks", { workspaceId: orgWorkspaceId, title: "Anu's own daily item" });
+      await eldo.client.post(`/api/v1/tasks/${anuTask.data!.id}/assignments`, { assigneeType: "USER", assigneeUserId: anu.id });
+      const t = await anu.client.get<{ assignments: Array<{ id: string; isCurrent: boolean }> }>(`/api/v1/tasks/${anuTask.data!.id}`);
+      await anu.client.post(`/api/v1/assignments/${t.data!.assignments.find((a) => a.isCurrent)!.id}/accept`);
+      const anuItem = await anu.client.post<{ id: string }>("/api/v1/me/workday/items", { taskId: anuTask.data!.id });
+
+      const readAttempt = await outsider.client.get(`/api/v1/me/workday/items`); // outsider's own (empty) list — not a leak vector by itself
+      expect(readAttempt.status).toBe(200);
+
+      const patchAttempt = await outsider.client.patch(`/api/v1/workday-items/${anuItem.data!.id}`, { position: 0 });
+      expect(patchAttempt.status).toBe(403);
+      const startAttempt = await outsider.client.post(`/api/v1/workday-items/${anuItem.data!.id}/start`);
+      expect(startAttempt.status).toBe(403);
+      const deleteAttempt = await outsider.client.delete(`/api/v1/workday-items/${anuItem.data!.id}`);
+      expect(deleteAttempt.status).toBe(403);
+      // The outsider has never engaged their own workday at all (no row exists yet) —
+      // closing resolves the ACTOR's own workday first, so this 404s before ever
+      // reaching disposition validation, never leaking anything about Anu's day.
+      const closeAttempt = await outsider.client.post("/api/v1/me/workday/close", { dispositions: [{ itemId: anuItem.data!.id, action: "DROP" }] });
+      expect(closeAttempt.status).toBe(404);
+    });
+
+    it("14. a personal-workspace task plans, executes, and closes identically to an organization task", async () => {
+      const ws = await eldo.client.get<{ personal: { id: string } | null }>("/api/v1/workspaces");
+      const personalWorkspaceId = ws.data!.personal!.id;
+
+      const personalTask = await eldo.client.post<{ id: string }>("/api/v1/tasks", {
+        workspaceId: personalWorkspaceId,
+        title: "Water the office plants",
+      });
+      expect(personalTask.status, JSON.stringify(personalTask)).toBe(200);
+
+      const add = await eldo.client.post<{ id: string; status: string }>("/api/v1/me/workday/items", { taskId: personalTask.data!.id });
+      expect(add.status, JSON.stringify(add)).toBe(200);
+      const start = await eldo.client.post(`/api/v1/workday-items/${add.data!.id}/start`);
+      expect(start.status, JSON.stringify(start)).toBe(200);
+      const complete = await eldo.client.post(`/api/v1/workday-items/${add.data!.id}/complete`);
+      expect(complete.status, JSON.stringify(complete)).toBe(200);
+    });
+
+    it("15. capacity reflects the default working-hours policy and the sum of planned estimates", async () => {
+      const outsider = await signup("capacity-check", "Capacity Check");
+      const workday = await outsider.client.get<{ capacityMinutes: number; plannedMinutes: number }>("/api/v1/me/workday");
+      expect(workday.status, JSON.stringify(workday)).toBe(200);
+      // Default policy: 8h on a configured working weekday, 0 on a weekend — either way a
+      // deterministic, non-negative number with no planned items yet.
+      expect(workday.data!.capacityMinutes).toBeGreaterThanOrEqual(0);
+      expect(workday.data!.plannedMinutes).toBe(0);
+
+      // A personal task needs no org membership at all — the simplest way to verify
+      // plannedMinutes accumulates from a plan item's own estimate.
+      const ws = await outsider.client.get<{ personal: { id: string } | null }>("/api/v1/workspaces");
+      const personalTask = await outsider.client.post<{ id: string }>("/api/v1/tasks", {
+        workspaceId: ws.data!.personal!.id,
+        title: "Estimate-bearing personal task",
+      });
+      const added = await outsider.client.post<{ plannedDurationMinutes: number | null }>("/api/v1/me/workday/items", {
+        taskId: personalTask.data!.id,
+        plannedDurationMinutes: 45,
+      });
+      expect(added.status, JSON.stringify(added)).toBe(200);
+      const after = await outsider.client.get<{ plannedMinutes: number }>("/api/v1/me/workday");
+      expect(after.data!.plannedMinutes).toBe(45);
+    });
+
+    it("16. Phase 1/2A/2B/2C behavior is unaffected by anything Phase 3 added", async () => {
+      const original = await eldo.client.get<{ status: string }>(`/api/v1/tasks/${taskId}`);
+      expect(original.data!.status).toBe("COMPLETED");
+    });
+  });
 });

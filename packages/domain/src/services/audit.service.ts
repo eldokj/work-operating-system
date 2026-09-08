@@ -22,6 +22,12 @@ export interface AuditLogEntry {
    * §6.7/§15) — same pattern as taskId above, third use of it.
    */
   projectId?: string | null;
+  /**
+   * Phase 3 addition (docs/architecture/19-phase3-daily-work-cycle-architecture-report.md
+   * §12/§20) — same pattern again, fourth use: a day's full activity history becomes one
+   * indexed query over this same table, never a parallel one.
+   */
+  workdayId?: string | null;
 }
 
 /**
@@ -48,6 +54,7 @@ export class AuditService {
         source: entry.source ?? "API",
         taskId: entry.taskId ?? null,
         projectId: entry.projectId ?? null,
+        workdayId: entry.workdayId ?? null,
       },
     });
   }
@@ -73,6 +80,23 @@ export class AuditService {
     const limit = opts.limit ?? 100;
     const rows = await this.db.auditLog.findMany({
       where: { projectId },
+      orderBy: { createdAt: "asc" },
+      take: limit + 1,
+      ...(opts.cursor ? { cursor: { id: opts.cursor }, skip: 1 } : {}),
+      include: { actor: { select: { id: true, fullName: true, email: true } } },
+    });
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+    return { items: page, nextCursor: hasMore ? page[page.length - 1]?.id ?? null : null };
+  }
+
+  /** Same as listForTask/listForProject, for a Workday — doc 19 §12/§20/§26. Read-only;
+   * the caller is responsible for the ownership check (a Workday's activity is always
+   * the owning user's own, per doc 19 §27 — never anyone else's to read). */
+  async listForWorkday(workdayId: string, opts: { limit?: number; cursor?: string } = {}) {
+    const limit = opts.limit ?? 100;
+    const rows = await this.db.auditLog.findMany({
+      where: { workdayId },
       orderBy: { createdAt: "asc" },
       take: limit + 1,
       ...(opts.cursor ? { cursor: { id: opts.cursor }, skip: 1 } : {}),

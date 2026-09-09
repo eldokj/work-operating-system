@@ -14,7 +14,7 @@ import {
   nextDailyPlanItemStatus,
 } from "../state-machines/daily-plan-item.machine";
 import { AuditService } from "./audit.service";
-import { TaskService } from "./task.service";
+import { isBlocked, TaskService } from "./task.service";
 
 const ITEM_TASK_SELECT = {
   id: true,
@@ -28,6 +28,12 @@ const ITEM_TASK_SELECT = {
   assignments: {
     where: { isCurrent: true },
     select: { assigneeType: true, assigneeUserId: true, status: true },
+  },
+  // Phase 8 — docs/architecture/28-phase8-task-dependencies-architecture-report.md §8.
+  // Same coarse-only shape as TaskService's TASK_DETAIL_INCLUDE — feeds isBlocked only.
+  dependencies: {
+    where: { type: "BLOCKS" },
+    select: { dependsOnTask: { select: { status: true } } },
   },
 } satisfies Prisma.TaskSelect;
 
@@ -270,6 +276,10 @@ export class DailyWorkService {
         project: item.task.project,
       },
       ownershipLost,
+      // Phase 8 — doc 28 §8: advisory only (doc 28's central resolution of the open
+      // question left in doc 27 §11) — this task can still be planned/started freely; the
+      // flag exists purely so the Plan tab can show it, never to gate anything.
+      isBlocked: isBlocked(item.task),
     };
   }
 

@@ -1,9 +1,10 @@
-import type { Prisma, PrismaClient } from "@ai-task-manager/db";
+import { Prisma, type PrismaClient } from "@ai-task-manager/db";
 import { PERMISSIONS } from "@ai-task-manager/shared";
 import type {
   AddChecklistItemInput,
   AddCommentInput,
   AddProgressUpdateInput,
+  AddTaskDependencyInput,
   CreateTaskInput,
   ReviewDecisionInput,
   TaskListFilter,
@@ -35,9 +36,34 @@ const TASK_DETAIL_INCLUDE = {
       respondedBy: { select: { id: true, fullName: true, email: true } },
     },
   },
+  // Phase 8 — docs/architecture/28-phase8-task-dependencies-architecture-report.md §4/§7.
+  // Deliberately coarse: just enough to compute isBlocked (a boolean — "something
+  // unresolved blocks this"), never the blocking task's own title/priority/etc. Full
+  // detail about a related task is exposed only via the dedicated, per-relation-
+  // re-authorized listDependencies() read below — never through this general include,
+  // which has no per-row authorization hook (the same reasoning doc 26 §18 already
+  // applied to keep Calendar's full event detail out of every other read).
+  dependencies: {
+    where: { type: "BLOCKS" },
+    select: { dependsOnTask: { select: { status: true } } },
+  },
 } satisfies Prisma.TaskInclude;
 
 export type TaskWithDetail = Prisma.TaskGetPayload<{ include: typeof TASK_DETAIL_INCLUDE }>;
+
+// doc 28 §5 — mirrors PermissionService's MAX_DEPARTMENT_DEPTH exactly: guards a
+// self-referential graph walk against bad/cyclic data already in the database, not a
+// realistic depth this codebase's own data would ever legitimately reach.
+const MAX_DEPENDENCY_DEPTH = 25;
+
+/** doc 28 §7 — a task is "blocked" if it has at least one BLOCKS dependency whose target
+ * hasn't reached a terminal state. Pure, computed over already-loaded data (mirrors
+ * isStuckAcknowledgement's exact shape, reporting.service.ts) — never a second query, and
+ * RELATES_TO dependencies never contribute (excluded upstream by TASK_DETAIL_INCLUDE's own
+ * `where: { type: "BLOCKS" }`, doc 28 §2/§9's explicit non-goal for that type). */
+export function isBlocked(task: Pick<TaskWithDetail, "dependencies">): boolean {
+  return task.dependencies.some((d) => d.dependsOnTask.status !== "COMPLETED" && d.dependsOnTask.status !== "CANCELLED");
+}
 
 export class TaskService {
   private readonly permissions: PermissionService;
@@ -676,5 +702,135 @@ export class TaskService {
     }
 
     return this.getTaskByIdOrThrow(actorId, taskId);
+  }
+
+  // ── Dependencies (Phase 8) ────────────────────────────────────────────
+  // docs/architecture/28-phase8-task-dependencies-architecture-report.md.
+
+  /**
+   * doc 28 §5 — before creating "A depends on B," walk B's own BLOCKS chain looking for A;
+   * finding it means the new edge would close a cycle (A→B→...→A). Reuses the exact
+   * defensive shape PermissionService.getDepartmentPath already established for a
+   * structurally identical problem (a self-referential chain that must never be trusted to
+   * terminate cleanly on bad data): a visited set plus an explicit depth bound, not a
+   * database-specific recursive query feature.
+   */
+  private async wouldCreateCycle(fromTaskId: string, targetTaskId: string, depth = 0, visited = new Set<string>()): Promise<boolean> {
+    if (fromTaskId === targetTaskId) return true;
+    if (depth >= MAX_DEPENDENCY_DEPTH || visited.has(fromTaskId)) return false;
+    visited.add(fromTaskId);
+    const edges = await this.db.taskDependency.findMany({
+      where: { taskId: fromTaskId, type: "BLOCKS" },
+      select: { dependsOnTaskId: true },
+    });
+    for (const edge of edges) {
+      if (await this.wouldCreateCycle(edge.dependsOnTaskId, targetTaskId, depth + 1, visited)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * doc 28 §4: the actor must be able to EDIT the dependent task (they're the one
+   * declaring it blocked) and VIEW the blocking task (canViewTask, via
+   * getTaskByIdOrThrow — never assumed from same-workspace membership alone). Same-
+   * workspace restriction is this phase's own deliberate narrowing of the authorization
+   * surface (doc 28 §4) — a dependency across two unrelated workspaces has no coherent
+   * product meaning.
+   */
+  async addDependency(actorId: string, taskId: string, input: AddTaskDependencyInput) {
+    const task = await this.getTaskByIdOrThrow(actorId, taskId);
+    await this.assertCanEdit(actorId, task);
+
+    if (input.dependsOnTaskId === taskId) {
+      throw new ValidationError("A task cannot depend on itself");
+    }
+    const dependsOnTask = await this.getTaskByIdOrThrow(actorId, input.dependsOnTaskId);
+    if (dependsOnTask.workspaceId !== task.workspaceId) {
+      throw new ValidationError("A dependency can only be created between tasks in the same workspace");
+    }
+    if (input.type === "BLOCKS" && (await this.wouldCreateCycle(input.dependsOnTaskId, taskId))) {
+      throw new ConflictError("This would create a circular dependency");
+    }
+
+    let dependency;
+    try {
+      dependency = await this.db.taskDependency.create({
+        data: { taskId, dependsOnTaskId: input.dependsOnTaskId, type: input.type },
+      });
+    } catch (err) {
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+        throw new ConflictError("This dependency already exists");
+      }
+      throw err;
+    }
+
+    await this.audit.log({
+      organizationId: task.workspace.organizationId,
+      actorId,
+      action: "task.dependency_added",
+      entityType: "TaskDependency",
+      entityId: dependency.id,
+      taskId,
+      after: { dependsOnTaskId: input.dependsOnTaskId, type: input.type },
+    });
+
+    return dependency;
+  }
+
+  async removeDependency(actorId: string, taskId: string, dependencyId: string) {
+    const task = await this.getTaskByIdOrThrow(actorId, taskId);
+    await this.assertCanEdit(actorId, task);
+
+    const dependency = await this.db.taskDependency.findUnique({ where: { id: dependencyId } });
+    if (!dependency || dependency.taskId !== taskId) throw new NotFoundError("Dependency not found");
+
+    await this.db.taskDependency.delete({ where: { id: dependencyId } });
+    await this.audit.log({
+      organizationId: task.workspace.organizationId,
+      actorId,
+      action: "task.dependency_removed",
+      entityType: "TaskDependency",
+      entityId: dependencyId,
+      taskId,
+      before: { dependsOnTaskId: dependency.dependsOnTaskId, type: dependency.type },
+    });
+  }
+
+  /**
+   * doc 28 §4/§6 — both directions, each related task individually re-authorized via
+   * canViewTask before any title/status/priority is exposed. A related task the viewer
+   * cannot see is returned as a minimal { id, visible: false } placeholder, never omitted
+   * silently and never returned with detail — the disclosure rule this phase's whole
+   * authorization design rests on (the third application of the same principle doc 24 §16
+   * established for notifications and doc 26 §13 established for calendar visibility).
+   */
+  async listDependencies(actorId: string, taskId: string) {
+    await this.getTaskByIdOrThrow(actorId, taskId); // enforces visibility on the task itself
+
+    const [dependsOn, dependedOnBy] = await Promise.all([
+      this.db.taskDependency.findMany({ where: { taskId }, orderBy: { id: "asc" } }),
+      this.db.taskDependency.findMany({ where: { dependsOnTaskId: taskId }, orderBy: { id: "asc" } }),
+    ]);
+
+    const relatedIds = [...new Set([...dependsOn.map((d) => d.dependsOnTaskId), ...dependedOnBy.map((d) => d.taskId)])];
+    const relatedTasks = await this.getTasksRawByIds(relatedIds); // batched — one query, not N
+    const relatedById = new Map(relatedTasks.map((t) => [t.id, t]));
+
+    const toEdge = async (relatedId: string, edgeId: string, type: string) => {
+      const relatedTask = relatedById.get(relatedId);
+      if (relatedTask && (await this.canViewTask(actorId, relatedTask))) {
+        return {
+          id: edgeId,
+          type,
+          relatedTask: { id: relatedId, visible: true as const, title: relatedTask.title, status: relatedTask.status, priority: relatedTask.priority },
+        };
+      }
+      return { id: edgeId, type, relatedTask: { id: relatedId, visible: false as const } };
+    };
+
+    return {
+      dependencies: await Promise.all(dependsOn.map((d) => toEdge(d.dependsOnTaskId, d.id, d.type))),
+      dependedOnBy: await Promise.all(dependedOnBy.map((d) => toEdge(d.taskId, d.id, d.type))),
+    };
   }
 }

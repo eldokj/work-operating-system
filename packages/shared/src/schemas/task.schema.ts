@@ -92,3 +92,12 @@ export const reviewDecisionSchema = z.object({
   notes: z.string().max(5000).nullable().optional(),
 });
 export type ReviewDecisionInput = z.infer<typeof reviewDecisionSchema>;
+
+// Phase 8 — docs/architecture/28-phase8-task-dependencies-architecture-report.md §6.
+export const dependencyTypeSchema = z.enum(["BLOCKS", "RELATES_TO"]);
+
+export const addTaskDependencySchema = z.object({
+  dependsOnTaskId: z.string().uuid(),
+  type: dependencyTypeSchema.default("BLOCKS"),
+});
+export type AddTaskDependencyInput = z.infer<typeof addTaskDependencySchema>;

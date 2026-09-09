@@ -6,7 +6,7 @@ import { localDayBounds } from "../local-day";
 import { isOverdue } from "../state-machines/task-status.machine";
 import { PermissionService } from "./permission.service";
 import { ProjectService } from "./project.service";
-import { TaskService, type TaskWithDetail } from "./task.service";
+import { isBlocked, TaskService, type TaskWithDetail } from "./task.service";
 
 // docs/architecture/21-phase4-management-visibility-architecture-report.md §6/§25 — a
 // named, documented MVP default (not yet configurable per organization; §25 leaves the
@@ -37,14 +37,24 @@ export interface AttentionRequiredSummary {
   overCapacityCount: number;
   carryForwardRepeatCount: number;
   unplannedCount: number;
+  // Phase 8 — docs/architecture/28-phase8-task-dependencies-architecture-report.md §9.
+  // Additive, alongside stuckAcknowledgementCount, never a replacement for it — the two
+  // answer genuinely different questions ("nobody's responded yet" vs. "something else has
+  // to finish first").
+  blockedCount: number;
 }
 
-export function summarizeAttention(stuckCount: number, signals: TeamMemberDailySignal[]): AttentionRequiredSummary {
+export function summarizeAttention(
+  stuckCount: number,
+  signals: TeamMemberDailySignal[],
+  blockedCount: number
+): AttentionRequiredSummary {
   return {
     stuckAcknowledgementCount: stuckCount,
     overCapacityCount: signals.filter((s) => s.overCapacity).length,
     carryForwardRepeatCount: signals.reduce((sum, s) => sum + s.carryForwardRepeatCount, 0),
     unplannedCount: signals.reduce((sum, s) => sum + s.unplannedItemCount, 0),
+    blockedCount,
   };
 }
 
@@ -200,6 +210,9 @@ export class ReportingService {
     // loaded above), not a new query.
     const now = new Date();
     const stuckAcknowledgement = teamTasks.filter((t) => isStuckAcknowledgement(t, now));
+    // doc 28 §9 — same "computed over already-loaded teamTasks, no new query" discipline
+    // as stuckAcknowledgement immediately above.
+    const blocked = teamTasks.filter((t) => isBlocked(t));
 
     return {
       team,
@@ -211,7 +224,8 @@ export class ReportingService {
       pendingAcceptance: incoming,
       workload,
       stuckAcknowledgement,
-      attentionRequired: summarizeAttention(stuckAcknowledgement.length, signals),
+      blocked,
+      attentionRequired: summarizeAttention(stuckAcknowledgement.length, signals, blocked.length),
     };
   }
 
@@ -239,6 +253,8 @@ export class ReportingService {
         overdue: deptTasks.filter((t) => isOverdue(t.status, t.dueDate)).length,
         // doc 21 §4/§6 — "which teams/departments have acknowledgement bottlenecks."
         stuckAcknowledgementCount: deptTasks.filter((t) => isStuckAcknowledgement(t, now)).length,
+        // doc 28 §9 — same placement, same batched-data discipline.
+        blockedCount: deptTasks.filter((t) => isBlocked(t)).length,
       };
     });
 
@@ -253,6 +269,7 @@ export class ReportingService {
         completed: teamTasks.filter((t) => t.status === "COMPLETED").length,
         overdue: teamTasks.filter((t) => isOverdue(t.status, t.dueDate)).length,
         stuckAcknowledgementCount: teamTasks.filter((t) => isStuckAcknowledgement(t, now)).length,
+        blockedCount: teamTasks.filter((t) => isBlocked(t)).length,
       };
     });
 
@@ -264,6 +281,7 @@ export class ReportingService {
     });
     const orgSignals = await this.dailyWork.getTeamSignals(activeMembers.map((m) => m.userId));
     const stuckAcknowledgementCount = allTasks.filter((t) => isStuckAcknowledgement(t, now)).length;
+    const blockedCount = allTasks.filter((t) => isBlocked(t)).length;
 
     return {
       totalTasks: allTasks.length,
@@ -273,7 +291,7 @@ export class ReportingService {
       completionTrend: { completedCount: completed.length, totalCount: allTasks.length },
       departmentPerformance,
       teamPerformance,
-      attentionRequired: summarizeAttention(stuckAcknowledgementCount, orgSignals),
+      attentionRequired: summarizeAttention(stuckAcknowledgementCount, orgSignals, blockedCount),
     };
   }
 }

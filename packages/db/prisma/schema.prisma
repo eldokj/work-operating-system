@@ -772,6 +772,11 @@ model TaskDependency {
   dependsOnTask Task @relation("DependsOnTask", fields: [dependsOnTaskId], references: [id], onDelete: Cascade)
 
   @@unique([taskId, dependsOnTaskId])
+  // Phase 8 — docs/architecture/28-phase8-task-dependencies-architecture-report.md §3. The
+  // compound unique above already indexes "what does taskId depend on"; this is the
+  // missing reverse direction ("what does dependsOnTaskId block") — every
+  // task.dependedOnBy read and every cycle-detection walk (§5) uses it.
+  @@index([dependsOnTaskId])
   @@map("task_dependencies")
 }
 

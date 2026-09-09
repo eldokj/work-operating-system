@@ -24,6 +24,8 @@ interface AttentionRequired {
   overCapacityCount: number;
   carryForwardRepeatCount: number;
   unplannedCount: number;
+  // Phase 8 — docs/architecture/28-phase8-task-dependencies-architecture-report.md §9.
+  blockedCount: number;
 }
 interface OverviewData {
   totalTasks: number;
@@ -36,6 +38,7 @@ interface OverviewData {
     completed: number;
     overdue: number;
     stuckAcknowledgementCount: number;
+    blockedCount: number;
   }>;
   teamPerformance: Array<{
     team: { id: string; name: string };
@@ -43,6 +46,7 @@ interface OverviewData {
     completed: number;
     overdue: number;
     stuckAcknowledgementCount: number;
+    blockedCount: number;
   }>;
   // Phase 4 — docs/architecture/21-phase4-management-visibility-architecture-report.md.
   // A small, fixed set of org-wide totals — never a full BI breakdown (doc 21 §12/§22).
@@ -97,7 +101,11 @@ function OverviewTab({ orgId }: { orgId: string }) {
 
   const attention = data.attentionRequired;
   const attentionTotal =
-    attention.stuckAcknowledgementCount + attention.overCapacityCount + attention.carryForwardRepeatCount + attention.unplannedCount;
+    attention.stuckAcknowledgementCount +
+    attention.overCapacityCount +
+    attention.carryForwardRepeatCount +
+    attention.unplannedCount +
+    attention.blockedCount;
 
   return (
     <div className="space-y-4">
@@ -110,6 +118,7 @@ function OverviewTab({ orgId }: { orgId: string }) {
               { label: "Over capacity today", value: attention.overCapacityCount },
               { label: "Repeatedly carried forward", value: attention.carryForwardRepeatCount },
               { label: "Unplanned items today", value: attention.unplannedCount },
+              { label: "Blocked", value: attention.blockedCount },
             ].map((s) => (
               <div key={s.label}>
                 <p className="text-lg font-semibold text-amber-900">{s.value}</p>
@@ -149,7 +158,14 @@ function OverviewTab({ orgId }: { orgId: string }) {
 function PerformanceTable({
   rows,
 }: {
-  rows: Array<{ name: string; totalTasks: number; completed: number; overdue: number; stuckAcknowledgementCount: number }>;
+  rows: Array<{
+    name: string;
+    totalTasks: number;
+    completed: number;
+    overdue: number;
+    stuckAcknowledgementCount: number;
+    blockedCount: number;
+  }>;
 }) {
   if (rows.length === 0) return <p className="text-sm text-slate-400">No data yet.</p>;
   return (
@@ -161,6 +177,7 @@ function PerformanceTable({
           <th className="py-1 font-medium">Completed</th>
           <th className="py-1 font-medium">Overdue</th>
           <th className="py-1 font-medium">Stuck</th>
+          <th className="py-1 font-medium">Blocked</th>
         </tr>
       </thead>
       <tbody>
@@ -173,6 +190,7 @@ function PerformanceTable({
             <td className={`py-1.5 ${r.stuckAcknowledgementCount > 0 ? "font-medium text-amber-700" : "text-slate-600"}`}>
               {r.stuckAcknowledgementCount}
             </td>
+            <td className={`py-1.5 ${r.blockedCount > 0 ? "font-medium text-red-700" : "text-slate-600"}`}>{r.blockedCount}</td>
           </tr>
         ))}
       </tbody>

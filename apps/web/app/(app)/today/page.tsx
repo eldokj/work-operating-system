@@ -28,6 +28,11 @@ interface DailyPlanItem {
   carriedFromItemId: string | null;
   task: TaskRef;
   ownershipLost: boolean;
+  // Phase 8 — docs/architecture/28-phase8-task-dependencies-architecture-report.md §8.
+  // Advisory only — this item can still be planned/started freely; the flag is purely a
+  // visual signal, never an enforcement gate (doc 28's central resolution of doc 27 §11's
+  // open question).
+  isBlocked: boolean;
 }
 interface WorkdaySummary {
   workDate: string;
@@ -492,6 +497,7 @@ function PlanTab({
                 <ItemTaskLine task={item.task} />
                 {item.isUnplanned && <span className="badge shrink-0 bg-amber-50 text-amber-700">Unplanned</span>}
                 {item.ownershipLost && <span className="badge shrink-0 bg-red-50 text-red-600">No longer yours</span>}
+                {item.isBlocked && <span className="badge shrink-0 bg-red-50 text-red-600">Blocked</span>}
                 <input
                   type="number"
                   min={0}

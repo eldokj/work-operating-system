@@ -24,6 +24,8 @@ interface AttentionRequired {
   overCapacityCount: number;
   carryForwardRepeatCount: number;
   unplannedCount: number;
+  // Phase 8 — docs/architecture/28-phase8-task-dependencies-architecture-report.md §9.
+  blockedCount: number;
 }
 interface TeamDashboard {
   team: { id: string; name: string };
@@ -101,7 +103,11 @@ export default function TeamDetailPage() {
 
   const attention = data.attentionRequired;
   const attentionTotal =
-    attention.stuckAcknowledgementCount + attention.overCapacityCount + attention.carryForwardRepeatCount + attention.unplannedCount;
+    attention.stuckAcknowledgementCount +
+    attention.overCapacityCount +
+    attention.carryForwardRepeatCount +
+    attention.unplannedCount +
+    attention.blockedCount;
 
   return (
     <div className="space-y-6">
@@ -116,6 +122,7 @@ export default function TeamDetailPage() {
               { label: "Over capacity today", value: attention.overCapacityCount },
               { label: "Repeatedly carried forward", value: attention.carryForwardRepeatCount },
               { label: "Unplanned items today", value: attention.unplannedCount },
+              { label: "Blocked", value: attention.blockedCount },
             ].map((s) => (
               <div key={s.label}>
                 <p className="text-lg font-semibold text-amber-900">{s.value}</p>

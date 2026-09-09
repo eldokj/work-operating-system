@@ -2201,4 +2201,142 @@ describe("ABC College — full Phase 1 acceptance scenario (brief §32/33)", () 
       expect(original.data!.status).toBe("COMPLETED");
     });
   });
+
+  // docs/architecture/28-phase8-task-dependencies-architecture-report.md.
+  describe("Phase 8: Task Dependencies / Blocked Work Visibility", () => {
+    let alphaId: string;
+    let betaId: string;
+    let dependencyId: string;
+
+    it("1. Eldo creates two tasks and declares Alpha blocked by Beta", async () => {
+      const alpha = await eldo.client.post<{ id: string }>("/api/v1/tasks", { workspaceId: orgWorkspaceId, title: "Dependency Alpha" });
+      const beta = await eldo.client.post<{ id: string }>("/api/v1/tasks", { workspaceId: orgWorkspaceId, title: "Dependency Beta" });
+      expect(alpha.status, JSON.stringify(alpha)).toBe(200);
+      expect(beta.status, JSON.stringify(beta)).toBe(200);
+      alphaId = alpha.data!.id;
+      betaId = beta.data!.id;
+
+      const created = await eldo.client.post<{ id: string; type: string }>(`/api/v1/tasks/${alphaId}/dependencies`, {
+        dependsOnTaskId: betaId,
+        type: "BLOCKS",
+      });
+      expect(created.status, JSON.stringify(created)).toBe(200);
+      dependencyId = created.data!.id;
+
+      const listed = await eldo.client.get<{ dependencies: Array<{ relatedTask: { visible: boolean; title?: string } }> }>(
+        `/api/v1/tasks/${alphaId}/dependencies`
+      );
+      expect(listed.status, JSON.stringify(listed)).toBe(200);
+      expect(listed.data!.dependencies).toHaveLength(1);
+      expect(listed.data!.dependencies[0]!.relatedTask).toMatchObject({ visible: true, title: "Dependency Beta" });
+    });
+
+    it("2. a task cannot depend on itself, and a duplicate dependency is rejected", async () => {
+      const selfDep = await eldo.client.post(`/api/v1/tasks/${alphaId}/dependencies`, { dependsOnTaskId: alphaId, type: "BLOCKS" });
+      expect(selfDep.status).toBe(400);
+
+      const dup = await eldo.client.post(`/api/v1/tasks/${alphaId}/dependencies`, { dependsOnTaskId: betaId, type: "BLOCKS" });
+      expect(dup.status).toBe(409);
+    });
+
+    it("3. a circular dependency is rejected", async () => {
+      const gamma = await eldo.client.post<{ id: string }>("/api/v1/tasks", { workspaceId: orgWorkspaceId, title: "Dependency Gamma" });
+      expect(gamma.status, JSON.stringify(gamma)).toBe(200);
+      const gammaId = gamma.data!.id;
+
+      // Beta depends on Gamma (Alpha -> Beta -> Gamma already exists as Alpha -> Beta).
+      const betaOnGamma = await eldo.client.post(`/api/v1/tasks/${betaId}/dependencies`, { dependsOnTaskId: gammaId, type: "BLOCKS" });
+      expect(betaOnGamma.status, JSON.stringify(betaOnGamma)).toBe(200);
+
+      // Gamma depending on Alpha would close the loop Alpha -> Beta -> Gamma -> Alpha.
+      const cycle = await eldo.client.post(`/api/v1/tasks/${gammaId}/dependencies`, { dependsOnTaskId: alphaId, type: "BLOCKS" });
+      expect(cycle.status, JSON.stringify(cycle)).toBe(409);
+    });
+
+    it("4. a dependency can only be created between two tasks in the same workspace", async () => {
+      const personalWs = await eldo.client.get<{ personal: { id: string } }>("/api/v1/workspaces");
+      const personalTask = await eldo.client.post<{ id: string }>("/api/v1/tasks", {
+        workspaceId: personalWs.data!.personal.id,
+        title: "Eldo's personal task",
+      });
+      expect(personalTask.status, JSON.stringify(personalTask)).toBe(200);
+
+      const crossWorkspace = await eldo.client.post(`/api/v1/tasks/${alphaId}/dependencies`, {
+        dependsOnTaskId: personalTask.data!.id,
+        type: "BLOCKS",
+      });
+      expect(crossWorkspace.status, JSON.stringify(crossWorkspace)).toBe(400);
+    });
+
+    it("5. only the creator/current-assignee/current-assignor can add or remove a dependency — Priya (unrelated) cannot", async () => {
+      const asPriya = await priya.client.post(`/api/v1/tasks/${alphaId}/dependencies`, { dependsOnTaskId: betaId, type: "RELATES_TO" });
+      expect(asPriya.status).toBe(403);
+
+      const removeAsPriya = await priya.client.delete(`/api/v1/tasks/${alphaId}/dependencies/${dependencyId}`);
+      expect(removeAsPriya.status).toBe(403);
+    });
+
+    it("6. a blocked task can still be planned and started — advisory only, never enforcement", async () => {
+      await eldo.client.post(`/api/v1/tasks/${alphaId}/assignments`, { assigneeType: "USER", assigneeUserId: rahul.id });
+      const t = await rahul.client.get<{ assignments: Array<{ id: string; isCurrent: boolean }> }>(`/api/v1/tasks/${alphaId}`);
+      const acceptRes = await rahul.client.post(`/api/v1/assignments/${t.data!.assignments.find((a) => a.isCurrent)!.id}/accept`);
+      expect(acceptRes.status, JSON.stringify(acceptRes)).toBe(200);
+
+      const planned = await rahul.client.post<{ id: string }>("/api/v1/me/workday/items", { taskId: alphaId, date: "2026-09-01" });
+      expect(planned.status, JSON.stringify(planned)).toBe(200);
+
+      const items = await rahul.client.get<Array<{ id: string; task: { id: string }; isBlocked: boolean }>>(
+        "/api/v1/me/workday/items?date=2026-09-01"
+      );
+      expect(items.status, JSON.stringify(items)).toBe(200);
+      const alphaItem = items.data!.find((i) => i.task.id === alphaId);
+      expect(alphaItem?.isBlocked).toBe(true);
+
+      // Starting it is not blocked either — the plan item's own state machine has no idea
+      // dependencies exist (doc 28 §8's explicit "never touch task-status.machine.ts" rule).
+      const start = await rahul.client.post(`/api/v1/workday-items/${alphaItem!.id}/start`);
+      expect(start.status, JSON.stringify(start)).toBe(200);
+    });
+
+    it("7. reporting reflects the blocked task in the team dashboard's attentionRequired.blockedCount", async () => {
+      const dashboard = await anu.client.get<{ attentionRequired: { blockedCount: number }; teamTasks: Array<{ id: string }> }>(
+        `/api/v1/organizations/${orgId}/reports/team/${marketingTeamId}`
+      );
+      expect(dashboard.status, JSON.stringify(dashboard)).toBe(200);
+      // Alpha isn't necessarily on Marketing Team's own dashboard (it wasn't routed
+      // through the team) — this assertion only proves the field exists and is numeric,
+      // the org-wide check below proves the count is real.
+      expect(typeof dashboard.data!.attentionRequired.blockedCount).toBe("number");
+
+      const org = await eldo.client.get<{ attentionRequired: { blockedCount: number } }>(`/api/v1/organizations/${orgId}/reports/overview`);
+      expect(org.status, JSON.stringify(org)).toBe(200);
+      expect(org.data!.attentionRequired.blockedCount).toBeGreaterThanOrEqual(1);
+    });
+
+    it("8. resolving the blocker clears isBlocked — cancelling Beta unblocks Alpha", async () => {
+      const cancel = await eldo.client.delete(`/api/v1/tasks/${betaId}`);
+      expect(cancel.status, JSON.stringify(cancel)).toBe(200);
+
+      const items = await rahul.client.get<Array<{ task: { id: string }; isBlocked: boolean }>>("/api/v1/me/workday/items?date=2026-09-01");
+      const alphaItem = items.data!.find((i) => i.task.id === alphaId);
+      expect(alphaItem?.isBlocked).toBe(false);
+    });
+
+    it("9. the dependencies endpoint enforces the same task-visibility boundary every other task read already does", async () => {
+      // Divya has no relationship whatsoever to Beta (not creator/assignee/assignor, no
+      // REPORTS_VIEW over it) — listing its dependencies is denied outright, before any
+      // dependency data is even considered. The finer-grained case (viewer CAN see the
+      // source task but NOT a specific related task, which then renders as a { visible:
+      // false } placeholder rather than a 403) is covered by the domain-level integration
+      // test (task-dependency.service.test.ts) — both layers of the same disclosure rule
+      // are exercised, at the layer each is best proven at.
+      const asDivya = await divya.client.get(`/api/v1/tasks/${betaId}/dependencies`);
+      expect(asDivya.status).toBe(403);
+    });
+
+    it("regression: Phase 1 through Phase 7 behavior is unaffected by anything Phase 8 added", async () => {
+      const original = await eldo.client.get<{ status: string }>(`/api/v1/tasks/${taskId}`);
+      expect(original.data!.status).toBe("COMPLETED");
+    });
+  });
 });

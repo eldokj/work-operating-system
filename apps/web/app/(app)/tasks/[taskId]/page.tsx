@@ -8,6 +8,7 @@ import { StatusBadge, PriorityBadge } from "@/components/TaskCard";
 import { ConversationTab } from "@/components/task-detail/ConversationTab";
 import { FilesTab } from "@/components/task-detail/FilesTab";
 import { ActivityTab } from "@/components/task-detail/ActivityTab";
+import { DependenciesTab } from "@/components/task-detail/DependenciesTab";
 
 interface PersonRef {
   id: string;
@@ -56,7 +57,7 @@ interface Member {
   user: PersonRef;
 }
 
-const TABS = ["Overview", "Conversation", "Checklist", "Files", "Activity"] as const;
+const TABS = ["Overview", "Conversation", "Checklist", "Dependencies", "Files", "Activity"] as const;
 type Tab = (typeof TABS)[number];
 
 export default function TaskDetailPage() {
@@ -126,6 +127,10 @@ export default function TaskDetailPage() {
   const currentTeam = current?.assigneeType === "TEAM" ? teams.find((t) => t.id === current.assigneeTeam?.id) : undefined;
   const isReviewer = !!current && current.assignedBy.id === me.id;
   const isCreatorOrOriginAssignor = task.createdBy.id === me.id || task.originAssignor?.id === me.id;
+  // Phase 8 — mirrors TaskService.assertCanEdit's exact rule (doc 28 §4): creator, current
+  // assignee, or current assignor; personal-workspace tasks are always self-owned once
+  // loaded (canViewTask already gated that).
+  const canEditTask = task.workspace.type === "PERSONAL" || task.createdBy.id === me.id || isCurrentIndividualAssignee || isReviewer;
 
   async function run(action: () => Promise<unknown>) {
     setBusy(true);
@@ -280,6 +285,8 @@ export default function TaskDetailPage() {
           )}
         </div>
       )}
+
+      {tab === "Dependencies" && <DependenciesTab taskId={task.id} canEdit={canEditTask} />}
 
       {tab === "Files" && <FilesTab scope={{ kind: "TASK", id: task.id }} />}
 

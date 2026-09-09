@@ -61,20 +61,22 @@ describe("summarizeAttention", () => {
       { userId: "b", workdayStatus: "NOT_STARTED" as const, capacityMinutes: 480, plannedMinutes: 0, overCapacity: false, totalItemCount: 0, unplannedItemCount: 0, carryForwardRepeatCount: 0 },
       { userId: "c", workdayStatus: "CLOSED" as const, capacityMinutes: 480, plannedMinutes: 600, overCapacity: true, totalItemCount: 5, unplannedItemCount: 2, carryForwardRepeatCount: 1 },
     ];
-    expect(summarizeAttention(4, signals)).toEqual({
+    expect(summarizeAttention(4, signals, 2)).toEqual({
       stuckAcknowledgementCount: 4,
       overCapacityCount: 2,
       carryForwardRepeatCount: 3,
       unplannedCount: 3,
+      blockedCount: 2,
     });
   });
 
   it("handles an empty signal set", () => {
-    expect(summarizeAttention(0, [])).toEqual({
+    expect(summarizeAttention(0, [], 0)).toEqual({
       stuckAcknowledgementCount: 0,
       overCapacityCount: 0,
       carryForwardRepeatCount: 0,
       unplannedCount: 0,
+      blockedCount: 0,
     });
   });
 });

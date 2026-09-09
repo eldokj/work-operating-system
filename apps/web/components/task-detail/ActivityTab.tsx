@@ -38,6 +38,8 @@ const ACTION_LABEL: Record<string, string> = {
   "task.checklist_item_deleted": "removed a checklist item",
   "task.comment_added": "commented",
   "task.progress_update_added": "posted a progress update",
+  "task.dependency_added": "added a dependency",
+  "task.dependency_removed": "removed a dependency",
   "task.assignment.created": "assigned the task",
   "task.assignment.accepted": "accepted the assignment",
   "task.assignment.declined": "declined the assignment",
